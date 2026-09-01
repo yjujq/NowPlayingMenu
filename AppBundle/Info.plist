@@ -6,6 +6,8 @@
     <string>Now Playing Menu</string>
     <key>CFBundleExecutable</key>
     <string>NowPlayingMenu</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
     <string>com.yjujq.nowplayingmenu</string>
     <key>CFBundleName</key>

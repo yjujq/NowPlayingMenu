@@ -6,3 +6,6 @@
 NowPlayingMenu.app/
 
 .DS_Store
+
+# Собирается из AppIcon.iconset скриптом
+AppIcon.icns

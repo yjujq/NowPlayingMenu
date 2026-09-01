@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         marquee = MarqueeStatusItem(player: player, settings: settings)
+        if ControlCentreProbe.isEnabled { ControlCentreProbe.run() }
     }
 }
 
