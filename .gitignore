@@ -1,0 +1,8 @@
+# Промежуточные файлы сборки Swift Package — 270 МБ, пересобираются
+.build/
+.swiftpm/
+
+# Готовое приложение собирается скриптом
+NowPlayingMenu.app/
+
+.DS_Store
