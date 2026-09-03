@@ -11,7 +11,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         marquee = MarqueeStatusItem(player: player, settings: settings)
-        if ControlCentreProbe.isEnabled { ControlCentreProbe.run() }
     }
 }
 
@@ -43,10 +42,21 @@ final class NowPlayingModel: ObservableObject {
         return parts.joined(separator: settings.separator)
     }
 
+    private var pollTimer: Timer?
+
     init(settings: DisplaySettings) {
         self.settings = settings
         refresh()
-        Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+        schedulePolling()
+    }
+
+    /// Каждый опрос запускает отдельный процесс osascript — это недёшево.
+    /// Пока ничего не играет, спрашивать часто незачем.
+    private func schedulePolling() {
+        let interval: TimeInterval = isPlaying ? 5 : 15
+        guard pollTimer == nil || pollTimer?.timeInterval != interval else { return }
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
     }
@@ -69,6 +79,7 @@ final class NowPlayingModel: ObservableObject {
         artist = info["artist"] as? String ?? ""
         album = info["album"] as? String ?? ""
         artwork = nil
+        schedulePolling()
     }
 
 }
@@ -180,6 +191,20 @@ private final class MarqueeStatusItem: NSObject {
     private var page = 0
     private var lastMotion = Date.distantPast
     private var timer: Timer?
+
+    // Что уже отрисовано. Раньше эти свойства задавались заново на каждом
+    // проходе — семь раз в секунду, вечно, даже когда ничего не менялось.
+    private var idleApplied = false
+    private var appliedTitle = ""
+    private var appliedFont: NSFont?
+    private var appliedAlignment: NSTextAlignment?
+
+    /// Значок простоя строится один раз. Его пересоздание из системного
+    /// символа на каждом проходе и было основным расходом процессора.
+    private static let idleImage = NSImage(
+        systemSymbolName: "play.fill",
+        accessibilityDescription: "Nothing playing"
+    )
     private var settingsWindow: NSWindow?
 
     init(player: NowPlayingModel, settings: DisplaySettings) {
@@ -201,21 +226,36 @@ private final class MarqueeStatusItem: NSObject {
 
     @objc private func tick() {
         guard let button = statusItem.button else { return }
-        button.font = settings.font()
-        button.alignment = [.left, .center, .right][min(max(settings.alignment, 0), 2)]
+
+        // Шрифт и выравнивание задаются только в настройках, поэтому трогаем
+        // их при изменении, а не на каждом проходе.
+        let alignment: NSTextAlignment = [.left, .center, .right][min(max(settings.alignment, 0), 2)]
+        if appliedAlignment != alignment {
+            button.alignment = alignment
+            appliedAlignment = alignment
+        }
+        let font = settings.font()
+        if appliedFont != font {
+            button.font = font
+            appliedFont = font
+            appliedTitle = ""            // оформление изменилось — перерисовать
+        }
 
         guard player.isPlaying else {
-            statusItem.length = NSStatusItem.squareLength
-            lastText = ""
-            button.title = ""
-            button.attributedTitle = NSAttributedString(string: "")
-            button.image = NSImage(
-                systemSymbolName: "play.fill",
-                accessibilityDescription: "Nothing playing"
-            )
-            button.imagePosition = .imageOnly
+            // Простой рисуем один раз и дальше ничего не делаем.
+            if !idleApplied {
+                statusItem.length = NSStatusItem.squareLength
+                lastText = ""
+                appliedTitle = ""
+                button.title = ""
+                button.attributedTitle = NSAttributedString(string: "")
+                button.image = Self.idleImage
+                button.imagePosition = .imageOnly
+                idleApplied = true
+            }
             return
         }
+        idleApplied = false
 
         statusItem.length = CGFloat(settings.width)
         button.image = nil
@@ -253,7 +293,10 @@ private final class MarqueeStatusItem: NSObject {
             shownText = text
         }
 
-        button.attributedTitle = NSAttributedString(string: shownText, attributes: [.font: settings.font()])
+        if shownText != appliedTitle {
+            button.attributedTitle = NSAttributedString(string: shownText, attributes: [.font: font])
+            appliedTitle = shownText
+        }
     }
 
     @objc private func handleStatusClick() {
