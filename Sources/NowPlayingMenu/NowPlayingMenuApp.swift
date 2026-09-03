@@ -198,6 +198,7 @@ private final class MarqueeStatusItem: NSObject {
     private var appliedTitle = ""
     private var appliedFont: NSFont?
     private var appliedAlignment: NSTextAlignment?
+    private var appliedLength: Double?
 
     /// Значок простоя строится один раз. Его пересоздание из системного
     /// символа на каждом проходе и было основным расходом процессора.
@@ -245,6 +246,7 @@ private final class MarqueeStatusItem: NSObject {
             // Простой рисуем один раз и дальше ничего не делаем.
             if !idleApplied {
                 statusItem.length = NSStatusItem.squareLength
+                appliedLength = nil
                 lastText = ""
                 appliedTitle = ""
                 button.title = ""
@@ -257,22 +259,41 @@ private final class MarqueeStatusItem: NSObject {
         }
         idleApplied = false
 
-        statusItem.length = CGFloat(settings.width)
-        button.image = nil
-        button.imagePosition = .noImage
         let text = player.displayText
-        if text != lastText { lastText = text; offset = 0; page = 0; lastMotion = .distantPast }
+        let textChanged = text != lastText
+        if textChanged { lastText = text; offset = 0; page = 0; lastMotion = .distantPast }
+
+        // Пора ли двигать строку — выясняем ДО построения массивов символов.
+        // Таймер идёт в разы чаще, чем движется текст: при обычной скорости
+        // сдвиг раз в 0.7 секунды против прохода каждые 0.15. Без этой проверки
+        // на каждом холостом проходе всё равно строилась удвоенная строка.
+        let now = Date()
+        let motionDue: Bool
+        switch settings.displayMode {
+        case 1:  motionDue = now.timeIntervalSince(lastMotion) >= 1 / max(settings.scrollSpeed, 0.5)
+        case 2:  motionDue = now.timeIntervalSince(lastMotion) >= settings.pageInterval
+        default: motionDue = false
+        }
+        if !textChanged, !motionDue, !appliedTitle.isEmpty { return }
+
+        if appliedLength != settings.width {
+            statusItem.length = CGFloat(settings.width)
+            appliedLength = settings.width
+        }
+        if button.image != nil {
+            button.image = nil
+            button.imagePosition = .noImage
+        }
 
         let visibleCharacters = max(8, Int(settings.width / max(settings.fontSize * 0.58, 1)))
         let characters = Array(text)
         let shownText: String
         switch settings.displayMode {
         case 1: // Scroll
-            let interval = 1 / max(settings.scrollSpeed, 0.5)
-            if Date().timeIntervalSince(lastMotion) >= interval {
+            if motionDue {
                 let delta = settings.scrollDirection == 0 ? 1 : -1
                 offset = (offset + delta + max(characters.count, 1)) % max(characters.count, 1)
-                lastMotion = Date()
+                lastMotion = now
             }
             let looped = characters + Array("     ") + characters
             let start = min(offset, max(looped.count - 1, 0))
@@ -283,9 +304,9 @@ private final class MarqueeStatusItem: NSObject {
             // сбрасывался только при смене трека: на широкой полосе старый
             // номер выходил за длину строки и обрушивал приложение.
             if page >= pageCount { page = 0 }
-            if Date().timeIntervalSince(lastMotion) >= settings.pageInterval {
+            if motionDue {
                 page = (page + 1) % pageCount
-                lastMotion = Date()
+                lastMotion = now
             }
             let start = min(page * visibleCharacters, max(characters.count - 1, 0))
             shownText = String(characters[start..<min(start + visibleCharacters, characters.count)])
