@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import MediaRemoteBridge
 
 @MainActor
@@ -199,6 +200,7 @@ private final class MarqueeStatusItem: NSObject {
     private var appliedFont: NSFont?
     private var appliedAlignment: NSTextAlignment?
     private var appliedLength: Double?
+    private var settingsWatch: AnyCancellable?
 
     /// Значок простоя строится один раз. Его пересоздание из системного
     /// символа на каждом проходе и было основным расходом процессора.
@@ -221,8 +223,37 @@ private final class MarqueeStatusItem: NSObject {
         button.lineBreakMode = .byTruncatingTail
         button.font = settings.font()
 
-        timer = Timer.scheduledTimer(timeInterval: 0.15, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        rescheduleTimer()
         tick()
+
+        // Настройки — наблюдаемый объект, поэтому период подстраивается сразу
+        // при смене скорости, а не со следующего прохода. Уведомление приходит
+        // ДО записи нового значения, поэтому читаем его на следующем витке.
+        settingsWatch = settings.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.rescheduleTimer() }
+        }
+    }
+
+    /// Период таймера производен от скорости движения текста.
+    ///
+    /// Раньше он был жёстким — 0.15 с, — и при обычной скорости прокрутки
+    /// пять проходов из семи оказывались холостыми. Теперь таймер срабатывает
+    /// ровно тогда, когда есть что перерисовать.
+    private var tickInterval: TimeInterval {
+        switch settings.displayMode {
+        case 1:  return min(max(1 / max(settings.scrollSpeed, 0.5), 0.05), 1.0)
+        case 2:  return min(max(settings.pageInterval, 0.05), 1.0)
+        // Движения нет: проход нужен лишь чтобы заметить смену трека.
+        default: return 0.5
+        }
+    }
+
+    private func rescheduleTimer() {
+        let interval = tickInterval
+        if let timer, abs(timer.timeInterval - interval) < 0.001 { return }
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(timeInterval: interval, target: self,
+                                     selector: #selector(tick), userInfo: nil, repeats: true)
     }
 
     @objc private func tick() {
