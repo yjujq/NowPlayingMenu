@@ -1,10 +1,10 @@
 #!/bin/bash
-# Собирает NowPlayingMenu.app и, если попросили, ставит его в /Applications.
+# Builds NowPlayingMenu.app and, if asked, installs it into /Applications.
 #
-# Бандл собирается во временной папке вне ~/Documents: эта папка синхронизируется
-# с iCloud, а файловый провайдер помечает файлы атрибутами com.apple.FinderInfo
-# и com.apple.fileprovider, которые codesign отвергает и которые возвращаются
-# после очистки на месте.
+# The bundle is staged in a temporary folder outside ~/Documents: that folder
+# syncs with iCloud, and the file provider stamps files with com.apple.FinderInfo
+# and com.apple.fileprovider attributes, which codesign rejects and which come
+# straight back if cleaned in place.
 set -euo pipefail
 cd "$(dirname "$0")"
 PROJECT="$(pwd)"
@@ -13,18 +13,18 @@ APP="NowPlayingMenu.app"
 STAGE="$(mktemp -d /tmp/nowplayingmenu-build.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
 
-echo "==> сборка"
+echo "==> building"
 swift build -c release
 BIN_DIR="$(swift build -c release --show-bin-path)"
 
-echo "==> сборка бандла во временной папке"
+echo "==> staging the bundle in a temporary folder"
 mkdir -p "$STAGE/$APP/Contents/MacOS" "$STAGE/$APP/Contents/Resources"
 cp "$PROJECT/AppBundle/Info.plist" "$STAGE/$APP/Contents/Info.plist"
 cp "$BIN_DIR/NowPlayingMenu" "$STAGE/$APP/Contents/MacOS/NowPlayingMenu"
 
-# Ресурсный пакет только в Contents/Resources: копия рядом с исполняемым
-# файлом это нестандартное место для вложенного кода, подпись её отвергает.
-# Иконка: пересобираем из набора размеров, если он на месте.
+# The resource bundle goes only into Contents/Resources: a copy beside the
+# executable is a non-standard place for nested code and the signature rejects it.
+# Icon: rebuild it from the size set if that set is present.
 if [ -d "$PROJECT/AppIcon.iconset" ]; then
     iconutil -c icns "$PROJECT/AppIcon.iconset" -o "$PROJECT/AppIcon.icns"
 fi
@@ -37,28 +37,28 @@ xattr -cr "$STAGE/$APP" 2>/dev/null || true
 
 IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | awk 'NR==1 && /\)/ {print $2}')
 if [ -n "${IDENTITY:-}" ]; then
-    echo "==> подпись ($IDENTITY)"
+    echo "==> signing ($IDENTITY)"
     codesign --force --deep --sign "$IDENTITY" "$STAGE/$APP"
 else
-    echo "==> подпись ad-hoc"
+    echo "==> ad-hoc signing"
     codesign --force --deep --sign - "$STAGE/$APP"
 fi
 
 if codesign --verify --strict --deep "$STAGE/$APP" 2>/tmp/nowplaying-codesign.txt; then
-    echo "==> подпись действительна"
+    echo "==> signature is valid"
 else
-    echo "ОШИБКА: подпись не прошла проверку" >&2
+    echo "ERROR: the signature failed verification" >&2
     cat /tmp/nowplaying-codesign.txt >&2
     exit 1
 fi
 
 if [ "${1:-}" = "--install" ]; then
-    echo "==> установка в /Applications"
+    echo "==> installing into /Applications"
     rm -rf "/Applications/$APP"
     ditto "$STAGE/$APP" "/Applications/$APP"
     echo "    /Applications/$APP"
 else
     rm -rf "$PROJECT/$APP"
     ditto "$STAGE/$APP" "$PROJECT/$APP"
-    echo "Готово: $PROJECT/$APP (для установки: ./make-app.sh --install)"
+    echo "Done: $PROJECT/$APP (to install: ./make-app.sh --install)"
 fi

@@ -33,9 +33,12 @@ final class NowPlayingModel: ObservableObject {
     @Published private(set) var album = ""
     @Published private(set) var artwork: NSImage?
     @Published private(set) var isPlaying = false
+    /// Whether there is a track at all. Differs from isPlaying: while paused
+    /// a track exists but nothing plays — and the title must stay on screen.
+    @Published private(set) var hasTrack = false
 
     var displayText: String {
-        guard isPlaying else { return "Nothing playing" }
+        guard hasTrack else { return "Nothing playing" }
         var parts: [String] = []
         if settings.showsArtist && !artist.isEmpty { parts.append(artist) }
         parts.append(title)
@@ -51,8 +54,8 @@ final class NowPlayingModel: ObservableObject {
         schedulePolling()
     }
 
-    /// Каждый опрос запускает отдельный процесс osascript — это недёшево.
-    /// Пока ничего не играет, спрашивать часто незачем.
+    /// Every poll spawns a separate osascript process, which is not cheap.
+    /// While nothing is playing there is no point asking often.
     private func schedulePolling() {
         let interval: TimeInterval = isPlaying ? 5 : 15
         guard pollTimer == nil || pollTimer?.timeInterval != interval else { return }
@@ -76,6 +79,7 @@ final class NowPlayingModel: ObservableObject {
         let playbackRate = (info["playbackRate"] as? NSNumber)?.doubleValue ?? 0
 
         isPlaying = !newTitle.isEmpty && playbackRate > 0
+        hasTrack = !newTitle.isEmpty
         title = newTitle.isEmpty ? "Nothing playing" : newTitle
         artist = info["artist"] as? String ?? ""
         album = info["album"] as? String ?? ""
@@ -146,36 +150,36 @@ private enum SystemNowPlaying {
 
         do {
             try process.run()
-            // Читаем до ожидания завершения: иначе полный буфер трубы
-            // остановит дочерний процесс, и мы застрянем оба.
+            // Read before waiting for exit: otherwise a full pipe buffer
+            // stalls the child process and both of us get stuck.
             let data = output.fileHandleForReading.readDataToEndOfFile()
             let errorData = errors.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
 
             guard process.terminationStatus == 0 else {
-                report("сценарий завершился с кодом \(process.terminationStatus)", errorData)
+                report("script exited with code \(process.terminationStatus)", errorData)
                 return [:]
             }
             guard let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-                report("не удалось разобрать ответ сценария", data)
+                report("could not parse the script output", data)
                 return [:]
             }
             return parsed
         } catch {
-            report("сценарий не запустился: \(error.localizedDescription)", nil)
+            report("script failed to start: \(error.localizedDescription)", nil)
             return [:]
         }
     }
 
-    /// Об ошибках сообщаем вслух. Молчаливый возврат пустого словаря делал
-    /// сломанный сценарий неотличимым от «ничего не играет», и поломку
-    /// невозможно было заметить.
+    /// Report failures out loud. Silently returning an empty dictionary made
+    /// a broken script indistinguishable from "nothing playing", so breakage
+    /// went unnoticed.
     private static var lastReport = ""
     private static func report(_ message: String, _ detail: Data?) {
         let text = String(data: detail ?? Data(), encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let full = text.isEmpty ? message : "\(message): \(text)"
-        guard full != lastReport else { return }   // не сорим повтором каждые пять секунд
+        guard full != lastReport else { return }   // do not repeat the same line every five seconds
         lastReport = full
         FileHandle.standardError.write(Data(("NowPlaying: " + full + "\n").utf8))
     }
@@ -193,17 +197,20 @@ private final class MarqueeStatusItem: NSObject {
     private var lastMotion = Date.distantPast
     private var timer: Timer?
 
-    // Что уже отрисовано. Раньше эти свойства задавались заново на каждом
-    // проходе — семь раз в секунду, вечно, даже когда ничего не менялось.
+    // What has already been drawn. These used to be set again on every tick —
+    // seven times a second, forever, even when nothing had changed.
     private var idleApplied = false
     private var appliedTitle = ""
     private var appliedFont: NSFont?
     private var appliedAlignment: NSTextAlignment?
     private var appliedLength: Double?
+    /// Whether it was playing on the previous tick. The change marks the
+    /// exact moment playback was paused.
+    private var wasPlaying = false
     private var settingsWatch: AnyCancellable?
 
-    /// Значок простоя строится один раз. Его пересоздание из системного
-    /// символа на каждом проходе и было основным расходом процессора.
+    /// The idle icon is built once. Rebuilding it from a system symbol on
+    /// every tick was the main source of CPU load.
     private static let idleImage = NSImage(
         systemSymbolName: "play.fill",
         accessibilityDescription: "Nothing playing"
@@ -226,24 +233,27 @@ private final class MarqueeStatusItem: NSObject {
         rescheduleTimer()
         tick()
 
-        // Настройки — наблюдаемый объект, поэтому период подстраивается сразу
-        // при смене скорости, а не со следующего прохода. Уведомление приходит
-        // ДО записи нового значения, поэтому читаем его на следующем витке.
+        // Settings is an observable object, so the period adapts the moment
+        // the speed changes rather than on the next tick. The notification
+        // arrives BEFORE the new value is stored, so we read it one turn later.
         settingsWatch = settings.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.rescheduleTimer() }
         }
     }
 
-    /// Период таймера производен от скорости движения текста.
+    /// The timer period is derived from how fast the text moves.
     ///
-    /// Раньше он был жёстким — 0.15 с, — и при обычной скорости прокрутки
-    /// пять проходов из семи оказывались холостыми. Теперь таймер срабатывает
-    /// ровно тогда, когда есть что перерисовать.
+    /// It used to be fixed at 0.15 s, and at ordinary scroll speed five ticks
+    /// out of seven did nothing. Now the timer fires exactly when there is
+    /// something to redraw.
     private var tickInterval: TimeInterval {
+        // Paused means no motion, so frequent ticks are pointless: we only
+        // need to notice playback resuming or the track changing.
+        guard player.isPlaying else { return 0.5 }
         switch settings.displayMode {
         case 1:  return min(max(1 / max(settings.scrollSpeed, 0.5), 0.05), 1.0)
         case 2:  return min(max(settings.pageInterval, 0.05), 1.0)
-        // Движения нет: проход нужен лишь чтобы заметить смену трека.
+        // No motion: the tick only needs to notice a track change.
         default: return 0.5
         }
     }
@@ -259,8 +269,8 @@ private final class MarqueeStatusItem: NSObject {
     @objc private func tick() {
         guard let button = statusItem.button else { return }
 
-        // Шрифт и выравнивание задаются только в настройках, поэтому трогаем
-        // их при изменении, а не на каждом проходе.
+        // Font and alignment only change from settings, so touch them when
+        // they change rather than on every tick.
         let alignment: NSTextAlignment = [.left, .center, .right][min(max(settings.alignment, 0), 2)]
         if appliedAlignment != alignment {
             button.alignment = alignment
@@ -270,11 +280,11 @@ private final class MarqueeStatusItem: NSObject {
         if appliedFont != font {
             button.font = font
             appliedFont = font
-            appliedTitle = ""            // оформление изменилось — перерисовать
+            appliedTitle = ""            // styling changed, force a redraw
         }
 
-        guard player.isPlaying else {
-            // Простой рисуем один раз и дальше ничего не делаем.
+        guard player.hasTrack else {
+            // Draw the idle state once and then do nothing.
             if !idleApplied {
                 statusItem.length = NSStatusItem.squareLength
                 appliedLength = nil
@@ -294,16 +304,28 @@ private final class MarqueeStatusItem: NSObject {
         let textChanged = text != lastText
         if textChanged { lastText = text; offset = 0; page = 0; lastMotion = .distantPast }
 
-        // Пора ли двигать строку — выясняем ДО построения массивов символов.
-        // Таймер идёт в разы чаще, чем движется текст: при обычной скорости
-        // сдвиг раз в 0.7 секунды против прохода каждые 0.15. Без этой проверки
-        // на каждом холостом проходе всё равно строилась удвоенная строка.
+        // Decide whether to advance BEFORE building character arrays. The
+        // timer runs far more often than the text moves: at ordinary speed the
+        // shift happens every 0.7 s against a tick every 0.15 s. Without this
+        // check every idle tick still built the doubled string.
         let now = Date()
-        let motionDue: Bool
+        var motionDue: Bool
         switch settings.displayMode {
         case 1:  motionDue = now.timeIntervalSince(lastMotion) >= 1 / max(settings.scrollSpeed, 0.5)
         case 2:  motionDue = now.timeIntervalSince(lastMotion) >= settings.pageInterval
         default: motionDue = false
+        }
+        // Paused: the title stays visible but does not scroll.
+        if !player.isPlaying { motionDue = false }
+
+        // The moment playback pauses, jump back to the start of the title:
+        // freezing mid-scroll would show a fragment of a word.
+        let justPaused = wasPlaying && !player.isPlaying
+        wasPlaying = player.isPlaying
+        if justPaused {
+            offset = 0
+            page = 0
+            appliedTitle = ""      // force a redraw
         }
         if !textChanged, !motionDue, !appliedTitle.isEmpty { return }
 
@@ -331,9 +353,9 @@ private final class MarqueeStatusItem: NSObject {
             shownText = String(looped[start..<min(start + visibleCharacters, looped.count)])
         case 2: // Pages
             let pageCount = max(Int(ceil(Double(characters.count) / Double(visibleCharacters))), 1)
-            // Ширина и размер шрифта меняются в настройках, а номер страницы
-            // сбрасывался только при смене трека: на широкой полосе старый
-            // номер выходил за длину строки и обрушивал приложение.
+            // Width and font size change from settings while the page index
+            // only reset on a track change: on a wide bar the stale index ran
+            // past the end of the string and crashed the app.
             if page >= pageCount { page = 0 }
             if motionDue {
                 page = (page + 1) % pageCount

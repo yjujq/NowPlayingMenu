@@ -1,7 +1,7 @@
 import AppKit
 
-/// Рисует иконку приложения во всех нужных размерах.
-/// Координаты заданы в холсте 1024 и масштабируются множителем.
+/// Draws the application icon at every size that is needed.
+/// Coordinates are given on a 1024 canvas and scaled by a factor.
 
 func rounded(_ rect: CGRect, _ radius: CGFloat) -> CGPath {
     CGPath(roundedRect: rect, cornerWidth: radius, cornerHeight: radius, transform: nil)
@@ -16,7 +16,7 @@ func drawIcon(size: Int) -> CGImage? {
     ctx.setShouldAntialias(true)
     ctx.interpolationQuality = .high
 
-    // Плитка со скруглением, как у системных иконок.
+    // A rounded tile, the same shape system icons use.
     let tile = CGRect(x: 62 * s, y: 62 * s, width: 900 * s, height: 900 * s)
     ctx.saveGState()
     ctx.addPath(rounded(tile, 200 * s))
@@ -34,8 +34,8 @@ func drawIcon(size: Int) -> CGImage? {
     }
     ctx.restoreGState()
 
-    // Столбики уровня — самый узнаваемый знак звучащей музыки, и он
-    // не расплывается в мелких размерах, в отличие от нотного знака.
+    // Level bars are the most recognisable sign of music playing, and unlike
+    // a musical note they stay legible at small sizes.
     let heights: [CGFloat] = [250, 430, 330, 520, 300]
     let barWidth: CGFloat = 78
     let gap: CGFloat = 40
@@ -71,4 +71,4 @@ for (name, size) in sizes {
     CGImageDestinationAddImage(dest, image, nil)
     CGImageDestinationFinalize(dest)
 }
-print("нарисовано размеров: \(sizes.count)")
+print("sizes drawn: \(sizes.count)")
