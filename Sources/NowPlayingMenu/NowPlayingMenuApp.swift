@@ -431,17 +431,42 @@ private final class MarqueeStatusItem: NSObject {
             return
         }
 
+        // Glass: a blur layer blending with whatever is behind the window,
+        // with the interface laid over it. Built in AppKit rather than
+        // wrapped for SwiftUI — a window background is the content view's
+        // job, and going through NSViewRepresentable would only add a layer
+        // that has already given trouble elsewhere in these apps.
+        let backdrop = NSVisualEffectView()
+        backdrop.material = .sidebar
+        backdrop.blendingMode = .behindWindow
+        backdrop.state = .active
+
         let content = NSHostingView(rootView: SettingsView(settings: settings))
+        content.autoresizingMask = [.width, .height]
+        backdrop.addSubview(content)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 430, height: 520),
-            styleMask: [.titled, .closable],
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 580),
+            styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
-        window.title = "Settings"
+        // The title bar stays — it carries the close and minimise buttons —
+        // but goes transparent with its title hidden, so the content runs the
+        // full height of the window. Otherwise the bar sits as a separate
+        // strip above the content and the rounded corners read as two
+        // surfaces stacked rather than one.
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        // Without a bar to grab, the background has to be draggable.
+        window.isMovableByWindowBackground = true
         window.isReleasedWhenClosed = false
-        window.contentView = content
+        // Without both of these the window paints its own opaque backing
+        // first and the blur has nothing behind it to show.
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.contentView = backdrop
+        content.frame = backdrop.bounds
         window.center()
         settingsWindow = window
         window.makeKeyAndOrderFront(nil)
@@ -453,7 +478,23 @@ private struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
 
     var body: some View {
-        Form {
+        VStack(spacing: 0) {
+            // Drawn here rather than left to the window: the title bar is
+            // transparent, so its own title would float above the content
+            // instead of sitting inside it. The top padding clears the
+            // traffic lights and puts the heading on their line.
+            Text("Settings")
+                .font(.system(size: 13, weight: .semibold))
+                .frame(maxWidth: .infinity)
+                .padding(.top, 13)
+
+            // The form has a height of its own and will not stretch, so the
+            // leftover height of a tall window has to go somewhere. Split
+            // evenly it tore the heading away from the content, so the gap
+            // below the heading is capped and the rest falls to the bottom.
+            Spacer(minLength: 0).frame(maxHeight: 20)
+
+            Form {
             Section("Display") {
                 Picker("Mode", selection: $settings.displayMode) {
                     Text("Static").tag(0)
@@ -497,9 +538,20 @@ private struct SettingsView: View {
                 Spacer()
                 Button("Reset to Defaults") { settings.reset() }
             }
+            }
+            .padding(20)
+
+            Spacer(minLength: 0)
         }
-        .padding(20)
-        .frame(width: 430, height: 520)
+        // Pinned to the top: left to itself the stack centres in the frame,
+        // which pushed the heading half an inch down and below the traffic
+        // lights instead of level with them.
+        .frame(width: 380, height: 580, alignment: .top)
+        // No background of its own: the blur layer beneath the hosting view
+        // is what paints this window, and an opaque fill here would hide it.
+        // Nor is a scheme forced, unlike the panels in the other two apps —
+        // this is a plain system surface and follows the system's light and
+        // dark.
     }
 }
 
