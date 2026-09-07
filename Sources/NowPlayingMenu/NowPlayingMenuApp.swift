@@ -191,23 +191,120 @@ private final class MarqueeStatusItem: NSObject {
     private let settings: DisplaySettings
     // A fixed width prevents the menu bar from shifting as track metadata changes.
     private let statusItem = NSStatusBar.system.statusItem(withLength: 167)
-    private var lastText = ""
-    private var offset = 0
-    private var page = 0
-    private var lastMotion = Date.distantPast
-    private var timer: Timer?
 
-    // What has already been drawn. These used to be set again on every tick —
-    // seven times a second, forever, even when nothing had changed.
+    /// The clear space between the end of the line and the copy of it that
+    /// follows, so a loop does not read as one run-on sentence.
+    private static let loopGap: CGFloat = 28
+    private static let motionKey = "marquee"
+
+    /// The line lives in a layer of its own inside the button, and moves by a
+    /// Core Animation handed to the render server once.
+    ///
+    /// It was drawn by setting `button.image` on a timer instead, and that is
+    /// not affordable at any frame rate worth having: every change to the
+    /// content of a status item makes AppKit re-snapshot the whole item
+    /// (`-[NSStatusItem _updateReplicants]` → `_cacheDisplayInRect:`), about
+    /// three milliseconds a time. Thirty frames a second cost a quarter of a
+    /// core; the same line as an animated layer costs nothing per frame,
+    /// because the app is not woken for the frames at all.
+    private let lineLayer = CALayer()
+
+    /// The line, measured and rasterised: the text twice over, one loop apart,
+    /// on a single transparent strip. Frames are windows onto this strip.
+    private struct Line: Equatable {
+        let text: String
+        let font: NSFont
+        /// Light or dark. A template image was tinted by the menu bar for
+        /// free; a layer holds pixels, so the colour is baked in here and the
+        /// strip is redrawn when the bar changes.
+        let appearance: NSAppearance.Name
+        let width: CGFloat
+        let height: CGFloat
+        /// The average glyph, used to keep the speed setting in characters
+        /// per second now that the travel itself is measured in points.
+        let characterWidth: CGFloat
+        /// The distance from one copy of the line to the next.
+        let loop: CGFloat
+        let scale: CGFloat
+        let strip: CGImage?
+
+        // Rasterising is drawing, and drawing belongs on the main thread.
+        @MainActor
+        init(text: String, font: NSFont, gap: CGFloat, scale: CGFloat,
+             color: NSColor, appearance: NSAppearance.Name) {
+            self.text = text
+            self.font = font
+            self.scale = scale
+            self.appearance = appearance
+            let string = NSAttributedString(string: text, attributes: [
+                .font: font, .foregroundColor: color
+            ])
+            let size = string.size()
+            width = ceil(size.width)
+            let bar = NSStatusBar.system.thickness
+            // A little short of the full bar: a line the height of the bar
+            // would sit against its edges.
+            height = min(max(bar - 4, ceil(size.height)), bar)
+            characterWidth = width / CGFloat(max(text.count, 1))
+            loop = width + gap
+            // Locals, because a closure may not capture the properties of a
+            // value that is still being initialised.
+            let stripLoop = loop
+            let stripHeight = height
+            let y = (stripHeight - ceil(size.height)) / 2
+            strip = MarqueeStatusItem.raster(
+                NSSize(width: stripLoop + ceil(size.width), height: stripHeight), scale: scale
+            ) {
+                string.draw(at: NSPoint(x: 0, y: y))
+                // The second copy is what makes the loop seamless: it is
+                // already entering as the first one leaves.
+                string.draw(at: NSPoint(x: stripLoop, y: y))
+            }
+        }
+    }
+
+    /// The line held still: aligned in the item, and shortened with an
+    /// ellipsis if it is longer than the item — a sliced glyph reads as a
+    /// fault, an ellipsis as a decision. Kept because it depends on the width
+    /// and the alignment as well as on the line.
+    private struct Still: Equatable {
+        let width: CGFloat
+        let alignment: Int
+        let image: CGImage?
+    }
+
+    /// The animation currently installed on the layer.
+    private struct Motion: Equatable {
+        let loop: CGFloat
+        /// Points per second.
+        let speed: Double
+        let direction: Int
+        let running: Bool
+    }
+
+    /// What the layer is holding, so that neither is set again for nothing.
+    private enum Shown: Equatable {
+        case nothing
+        case strip
+        case still(width: CGFloat, alignment: Int)
+    }
+
+    private var line: Line?
+    private var still: Still?
+    private var motion: Motion?
+    private var shown: Shown = .nothing
+    private var page = 0
+    private var lastPageChange = Date.distantPast
+    /// Whether the line is actually travelling. It is not when it fits the
+    /// item, when playback is paused, or in Static mode.
+    private var moving = false
     private var idleApplied = false
-    private var appliedTitle = ""
-    private var appliedFont: NSFont?
-    private var appliedAlignment: NSTextAlignment?
     private var appliedLength: Double?
     /// Whether it was playing on the previous tick. The change marks the
     /// exact moment playback was paused.
     private var wasPlaying = false
     private var settingsWatch: AnyCancellable?
+    private var timer: Timer?
 
     /// The idle icon is built once. Rebuilding it from a system symbol on
     /// every tick was the main source of CPU load.
@@ -227,150 +324,245 @@ private final class MarqueeStatusItem: NSObject {
         button.action = #selector(handleStatusClick)
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.image = nil
-        button.lineBreakMode = .byTruncatingTail
-        button.font = settings.font()
+        button.wantsLayer = true
+        button.layer?.masksToBounds = true
+        // Anchored at its corner, so `position` is simply where the line
+        // starts; and no implicit animations, which would turn every one of
+        // these settings into a quarter-second fade of its own.
+        lineLayer.anchorPoint = .zero
+        lineLayer.actions = [
+            "position": NSNull(), "bounds": NSNull(),
+            "contents": NSNull(), "hidden": NSNull()
+        ]
+        button.layer?.addSublayer(lineLayer)
 
         rescheduleTimer()
         tick()
 
-        // Settings is an observable object, so the period adapts the moment
-        // the speed changes rather than on the next tick. The notification
+        // Settings is an observable object, so the display adapts the moment
+        // a value changes rather than on the next tick. The notification
         // arrives BEFORE the new value is stored, so we read it one turn later.
         settingsWatch = settings.objectWillChange.sink { [weak self] _ in
-            DispatchQueue.main.async { self?.rescheduleTimer() }
+            DispatchQueue.main.async { self?.tick() }
         }
     }
 
-    /// The timer period is derived from how fast the text moves.
-    ///
-    /// It used to be fixed at 0.15 s, and at ordinary scroll speed five ticks
-    /// out of seven did nothing. Now the timer fires exactly when there is
-    /// something to redraw.
+    /// Motion is the render server's job now, so the timer only has to notice
+    /// things changing: a new track, a setting, the bar going dark. Paging is
+    /// the exception — a page does not move, it is replaced.
     private var tickInterval: TimeInterval {
-        // Paused means no motion, so frequent ticks are pointless: we only
-        // need to notice playback resuming or the track changing.
-        guard player.isPlaying else { return 0.5 }
-        switch settings.displayMode {
-        case 1:  return min(max(1 / max(settings.scrollSpeed, 0.5), 0.05), 1.0)
-        case 2:  return min(max(settings.pageInterval, 0.05), 1.0)
-        // No motion: the tick only needs to notice a track change.
-        default: return 0.5
-        }
+        guard moving, settings.displayMode == 2 else { return 0.5 }
+        return min(max(settings.pageInterval, 0.05), 1.0)
     }
 
     private func rescheduleTimer() {
         let interval = tickInterval
         if let timer, abs(timer.timeInterval - interval) < 0.001 { return }
         timer?.invalidate()
-        timer = Timer.scheduledTimer(timeInterval: interval, target: self,
-                                     selector: #selector(tick), userInfo: nil, repeats: true)
+        let scheduled = Timer.scheduledTimer(timeInterval: interval, target: self,
+                                             selector: #selector(tick), userInfo: nil, repeats: true)
+        scheduled.tolerance = interval * 0.1
+        timer = scheduled
     }
 
     @objc private func tick() {
         guard let button = statusItem.button else { return }
-
-        // Font and alignment only change from settings, so touch them when
-        // they change rather than on every tick.
-        let alignment: NSTextAlignment = [.left, .center, .right][min(max(settings.alignment, 0), 2)]
-        if appliedAlignment != alignment {
-            button.alignment = alignment
-            appliedAlignment = alignment
-        }
-        let font = settings.font()
-        if appliedFont != font {
-            button.font = font
-            appliedFont = font
-            appliedTitle = ""            // styling changed, force a redraw
-        }
 
         guard player.hasTrack else {
             // Draw the idle state once and then do nothing.
             if !idleApplied {
                 statusItem.length = NSStatusItem.squareLength
                 appliedLength = nil
-                lastText = ""
-                appliedTitle = ""
+                line = nil
+                still = nil
+                motion = nil
+                shown = .nothing
+                moving = false
+                lineLayer.removeAnimation(forKey: Self.motionKey)
+                lineLayer.contents = nil
                 button.title = ""
                 button.attributedTitle = NSAttributedString(string: "")
                 button.image = Self.idleImage
                 button.imagePosition = .imageOnly
                 idleApplied = true
+                rescheduleTimer()
             }
             return
         }
-        idleApplied = false
+        if idleApplied {
+            button.image = nil
+            button.imagePosition = .noImage
+            idleApplied = false
+        }
 
+        if lineLayer.superlayer !== button.layer {
+            button.wantsLayer = true
+            button.layer?.masksToBounds = true
+            button.layer?.addSublayer(lineLayer)
+            shown = .nothing
+            motion = nil
+        }
+
+        let scale = button.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        let appearance = button.effectiveAppearance
+        let font = settings.font()
         let text = player.displayText
-        let textChanged = text != lastText
-        if textChanged { lastText = text; offset = 0; page = 0; lastMotion = .distantPast }
-
-        // Decide whether to advance BEFORE building character arrays. The
-        // timer runs far more often than the text moves: at ordinary speed the
-        // shift happens every 0.7 s against a tick every 0.15 s. Without this
-        // check every idle tick still built the doubled string.
-        let now = Date()
-        var motionDue: Bool
-        switch settings.displayMode {
-        case 1:  motionDue = now.timeIntervalSince(lastMotion) >= 1 / max(settings.scrollSpeed, 0.5)
-        case 2:  motionDue = now.timeIntervalSince(lastMotion) >= settings.pageInterval
-        default: motionDue = false
-        }
-        // Paused: the title stays visible but does not scroll.
-        if !player.isPlaying { motionDue = false }
-
-        // The moment playback pauses, jump back to the start of the title:
-        // freezing mid-scroll would show a fragment of a word.
-        let justPaused = wasPlaying && !player.isPlaying
-        wasPlaying = player.isPlaying
-        if justPaused {
-            offset = 0
+        if line?.text != text || line?.font != font
+            || line?.appearance != appearance.name || line?.scale != scale {
+            line = Line(text: text, font: font, gap: Self.loopGap, scale: scale,
+                        color: Self.textColor(for: appearance), appearance: appearance.name)
+            still = nil
+            motion = nil
+            shown = .nothing
             page = 0
-            appliedTitle = ""      // force a redraw
+            lastPageChange = .distantPast
         }
-        if !textChanged, !motionDue, !appliedTitle.isEmpty { return }
+        guard let line else { return }
 
         if appliedLength != settings.width {
             statusItem.length = CGFloat(settings.width)
             appliedLength = settings.width
         }
-        if button.image != nil {
-            button.image = nil
-            button.imagePosition = .noImage
+        // The width the line is actually drawn into: the button's own, once
+        // the bar has laid it out. An item keeps a little padding of its own.
+        let available = button.bounds.width > 1 ? button.bounds.width : CGFloat(settings.width)
+
+        // The whole line is already on screen, so there is nothing for motion
+        // to reveal. Scrolling a title that fits only made it harder to read,
+        // whatever the mode is set to.
+        let fits = line.width <= available
+
+        let justPaused = wasPlaying && !player.isPlaying
+        wasPlaying = player.isPlaying
+        if justPaused {
+            // Back to the start of the title: stopping mid-scroll would leave
+            // a fragment of a word on screen.
+            page = 0
+            lastPageChange = .distantPast
         }
 
-        let visibleCharacters = max(8, Int(settings.width / max(settings.fontSize * 0.58, 1)))
-        let characters = Array(text)
-        let shownText: String
+        moving = player.isPlaying && !fits && settings.displayMode != 0
+        let y = ((button.bounds.height - line.height) / 2).rounded()
+
         switch settings.displayMode {
-        case 1: // Scroll
-            if motionDue {
-                let delta = settings.scrollDirection == 0 ? 1 : -1
-                offset = (offset + delta + max(characters.count, 1)) % max(characters.count, 1)
-                lastMotion = now
+        case 1 where !fits:
+            showStrip(line)
+            let wanted = Motion(loop: line.loop,
+                                speed: max(settings.scrollSpeed, 0.1) * Double(line.characterWidth),
+                                direction: settings.scrollDirection,
+                                running: moving)
+            if motion != wanted {
+                motion = wanted
+                install(wanted, line: line, y: y)
             }
-            let looped = characters + Array("     ") + characters
-            let start = min(offset, max(looped.count - 1, 0))
-            shownText = String(looped[start..<min(start + visibleCharacters, looped.count)])
-        case 2: // Pages
-            let pageCount = max(Int(ceil(Double(characters.count) / Double(visibleCharacters))), 1)
+        case 2 where !fits:
+            showStrip(line)
+            stopMotion()
+            let pages = max(Int(ceil(line.width / available)), 1)
             // Width and font size change from settings while the page index
-            // only reset on a track change: on a wide bar the stale index ran
+            // only resets on a track change: on a wide bar the stale index ran
             // past the end of the string and crashed the app.
-            if page >= pageCount { page = 0 }
-            if motionDue {
-                page = (page + 1) % pageCount
-                lastMotion = now
+            if page >= pages { page = 0 }
+            let now = Date()
+            if moving, now.timeIntervalSince(lastPageChange) >= settings.pageInterval {
+                page = (page + 1) % pages
+                lastPageChange = now
             }
-            let start = min(page * visibleCharacters, max(characters.count - 1, 0))
-            shownText = String(characters[start..<min(start + visibleCharacters, characters.count)])
+            lineLayer.position = CGPoint(x: -CGFloat(page) * available, y: y)
         default:
-            shownText = text
+            stopMotion()
+            showStill(line, width: available, alignment: settings.alignment)
+            lineLayer.position = CGPoint(x: 0, y: y)
         }
 
-        if shownText != appliedTitle {
-            button.attributedTitle = NSAttributedString(string: shownText, attributes: [.font: font])
-            appliedTitle = shownText
+        rescheduleTimer()
+    }
+
+    private func showStrip(_ line: Line) {
+        guard shown != .strip else { return }
+        lineLayer.contentsScale = line.scale
+        lineLayer.bounds = CGRect(x: 0, y: 0, width: line.loop + line.width, height: line.height)
+        lineLayer.contents = line.strip
+        shown = .strip
+    }
+
+    private func showStill(_ line: Line, width: CGFloat, alignment: Int) {
+        guard shown != .still(width: width, alignment: alignment) else { return }
+        if still?.width != width || still?.alignment != alignment {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byTruncatingTail
+            paragraph.alignment = [.left, .center, .right][min(max(alignment, 0), 2)]
+            let string = NSAttributedString(string: line.text, attributes: [
+                .font: line.font,
+                .foregroundColor: Self.textColor(for: NSAppearance(named: line.appearance) ?? .currentDrawing()),
+                .paragraphStyle: paragraph
+            ])
+            let height = ceil(string.size().height)
+            let image = Self.raster(NSSize(width: width, height: line.height), scale: line.scale) {
+                string.draw(in: NSRect(x: 0, y: (line.height - height) / 2, width: width, height: height))
+            }
+            still = Still(width: width, alignment: alignment, image: image)
         }
+        lineLayer.contentsScale = line.scale
+        lineLayer.bounds = CGRect(x: 0, y: 0, width: width, height: line.height)
+        lineLayer.contents = still?.image
+        shown = .still(width: width, alignment: alignment)
+    }
+
+    private func stopMotion() {
+        motion = nil
+        // Unguarded: `motion` is also cleared when the track changes, and a
+        // guard would then leave the previous animation running under a line
+        // that is supposed to be standing still.
+        lineLayer.removeAnimation(forKey: Self.motionKey)
+    }
+
+    /// Hands the loop to the render server: one animation, repeating for as
+    /// long as the track lasts. At the end of a loop the second copy stands
+    /// exactly where the first one started, so the restart is invisible.
+    private func install(_ motion: Motion, line: Line, y: CGFloat) {
+        lineLayer.removeAnimation(forKey: Self.motionKey)
+        let start: CGFloat = motion.direction == 0 ? 0 : -line.loop
+        let end: CGFloat = motion.direction == 0 ? -line.loop : 0
+        lineLayer.position = CGPoint(x: start, y: y)
+        guard motion.running, motion.speed > 0 else { return }
+        let animation = CABasicAnimation(keyPath: "position.x")
+        animation.fromValue = start
+        animation.toValue = end
+        animation.duration = Double(line.loop) / motion.speed
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.isRemovedOnCompletion = false
+        lineLayer.add(animation, forKey: Self.motionKey)
+    }
+
+    /// The colour the menu bar draws its text in, resolved for the bar's own
+    /// appearance.
+    private static func textColor(for appearance: NSAppearance) -> NSColor {
+        var color = NSColor.labelColor
+        appearance.performAsCurrentDrawingAppearance {
+            color = NSColor.labelColor.usingColorSpace(.sRGB) ?? .labelColor
+        }
+        return color
+    }
+
+    /// Draws into a bitmap `size` points across at `scale` pixels to the
+    /// point, and hands back the pixels.
+    private static func raster(_ size: NSSize, scale: CGFloat, _ body: () -> Void) -> CGImage? {
+        guard let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int((size.width * scale).rounded(.up)),
+            pixelsHigh: Int((size.height * scale).rounded(.up)),
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ) else { return nil }
+        rep.size = size
+        guard let context = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        body()
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.cgImage
     }
 
     @objc private func handleStatusClick() {
@@ -410,15 +602,91 @@ private final class MarqueeStatusItem: NSObject {
         event?.cgEvent?.post(tap: .cghidEventTap)
     }
 
+    /// The menu is left to AppKit to draw.
+    ///
+    /// It was drawn by the app for a while — a custom view for the header and
+    /// one for every row — and a hand-drawn row does not follow the system:
+    /// its insets, its highlight and its vibrancy are whatever was hardcoded
+    /// here, and they drift from the menus beside it with every release of
+    /// macOS. Standard items carrying symbols and shortcuts give the same
+    /// shape and stay right.
     private func showMenu() {
         let menu = NSMenu()
-        menu.addItem(withTitle: player.displayText, action: nil, keyEquivalent: "")
+        // The header carries no action; without this AppKit would grey it out.
+        menu.autoenablesItems = false
+        // The menu is popped up from the status button and would otherwise
+        // inherit the button's appearance — which is the menu bar's, a
+        // vibrant one that follows the desktop picture rather than the system
+        // setting. That is right for the line drawn in the bar and wrong for
+        // a menu: it left the menu light while the rest of macOS was dark.
+        // A menu belongs to the app, so it takes the app's appearance.
+        menu.appearance = NSApp.effectiveAppearance
+
+        let header = NSMenuItem()
+        header.attributedTitle = headerTitle()
+        header.image = Self.menuSymbol(
+            player.hasTrack ? (player.isPlaying ? "waveform" : "pause.fill") : "music.note"
+        )
+        menu.addItem(header)
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Settings…", action: #selector(showSettings), keyEquivalent: ",").target = self
-        menu.addItem(withTitle: "Refresh", action: #selector(refresh), keyEquivalent: "r").target = self
-        menu.addItem(withTitle: "Quit", action: #selector(quit), keyEquivalent: "q").target = self
+
+        addItem(to: menu, "Settings…", symbol: "slider.horizontal.3", key: ",",
+                action: #selector(showSettings))
+        addItem(to: menu, "Refresh", symbol: "arrow.clockwise", key: "r",
+                action: #selector(refresh))
+        // Quit belongs apart from the two commands that act on the display,
+        // the way it sits apart in the system menus.
+        menu.addItem(.separator())
+        addItem(to: menu, "Quit", symbol: "power", key: "q", action: #selector(quit))
+
         guard let button = statusItem.button else { return }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+    }
+
+    private func addItem(to menu: NSMenu, _ title: String, symbol: String,
+                         key: String, action: Selector) {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
+        item.target = self
+        item.image = Self.menuSymbol(symbol)
+        menu.addItem(item)
+    }
+
+    /// The track at the top of the menu, on two lines: what is playing, and
+    /// who by. A plain disabled line of text read as an error message rather
+    /// than as the thing the app is about.
+    private func headerTitle() -> NSAttributedString {
+        let title = NSMutableAttributedString(
+            string: player.hasTrack ? player.title : "Nothing playing",
+            attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: .semibold),
+                .foregroundColor: NSColor.labelColor
+            ]
+        )
+        guard let subtitle = menuSubtitle() else { return title }
+        title.append(NSAttributedString(string: "\n" + subtitle, attributes: [
+            .font: NSFont.systemFont(ofSize: 11),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]))
+        return title
+    }
+
+    /// The second line of the header. It shows what the status item is not
+    /// already showing: with the artist hidden in Settings the menu is the
+    /// one place left to read it.
+    private func menuSubtitle() -> String? {
+        guard player.hasTrack else { return nil }
+        let parts = [player.artist, player.album].filter { !$0.isEmpty }
+        if !parts.isEmpty { return parts.joined(separator: settings.separator) }
+        return player.isPlaying ? "Playing" : "Paused"
+    }
+
+    private static func menuSymbol(_ name: String) -> NSImage? {
+        // A template, so the menu tints it for its own appearance and inverts
+        // it on the highlighted row.
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
+        image?.isTemplate = true
+        return image
     }
 
     @objc private func refresh() { player.refresh() }
@@ -446,7 +714,7 @@ private final class MarqueeStatusItem: NSObject {
         backdrop.addSubview(content)
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 380, height: 580),
+            contentRect: NSRect(origin: .zero, size: SettingsView.windowSize),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -474,8 +742,23 @@ private final class MarqueeStatusItem: NSObject {
     }
 }
 
+/// The settings panel: a stack of grouped cards over the window's blur, the
+/// shape System Settings has used since Ventura. It replaced a plain `Form`,
+/// whose boxed sections and full-width controls read as a decade-old
+/// preferences sheet next to the rest of the app.
+///
+/// The panel does not scroll. Every row is a fixed height, so the window is
+/// sized to hold all of them at once and the whole of it stays in view.
 private struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
+
+    static let windowSize = CGSize(width: 400, height: 604)
+
+    /// Scrolling and paging each use a different half of the Motion card.
+    /// Rather than hide the rows that do not apply — which would make the
+    /// card jump about as the mode changes — they are dimmed and disabled.
+    private var scrolls: Bool { settings.displayMode == 1 }
+    private var pages: Bool { settings.displayMode == 2 }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -487,71 +770,181 @@ private struct SettingsView: View {
                 .font(.system(size: 13, weight: .semibold))
                 .frame(maxWidth: .infinity)
                 .padding(.top, 13)
+                .padding(.bottom, 12)
 
-            // The form has a height of its own and will not stretch, so the
-            // leftover height of a tall window has to go somewhere. Split
-            // evenly it tore the heading away from the content, so the gap
-            // below the heading is capped and the rest falls to the bottom.
-            Spacer(minLength: 0).frame(maxHeight: 20)
-
-            Form {
-            Section("Display") {
-                Picker("Mode", selection: $settings.displayMode) {
-                    Text("Static").tag(0)
-                    Text("Scroll").tag(1)
-                    Text("Pages").tag(2)
+            VStack(alignment: .leading, spacing: 16) {
+                SettingsCard("Display") {
+                    SettingsRow("Mode") {
+                        Picker("", selection: $settings.displayMode) {
+                            Text("Static").tag(0)
+                            Text("Scroll").tag(1)
+                            Text("Pages").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 190)
+                    }
+                    SettingsDivider()
+                    SliderRow(title: "Width", value: $settings.width,
+                              range: 100...360, format: "%.0f pt")
+                    SettingsDivider()
+                    SettingsRow("Alignment") {
+                        Picker("", selection: $settings.alignment) {
+                            Text("Left").tag(0)
+                            Text("Center").tag(1)
+                            Text("Right").tag(2)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 190)
+                    }
                 }
-                .pickerStyle(.segmented)
 
-                SliderRow(title: "Width", value: $settings.width, range: 100...360, format: "%.0f pt")
-                Picker("Alignment", selection: $settings.alignment) {
-                    Text("Left").tag(0); Text("Center").tag(1); Text("Right").tag(2)
+                SettingsCard("Information") {
+                    SettingsRow("Show artist") {
+                        Toggle("", isOn: $settings.showsArtist).labelsHidden().toggleStyle(.switch)
+                    }
+                    SettingsDivider()
+                    SettingsRow("Show album") {
+                        Toggle("", isOn: $settings.showsAlbum).labelsHidden().toggleStyle(.switch)
+                    }
                 }
-                .pickerStyle(.segmented)
-            }
 
-            Section("Information") {
-                Toggle("Show artist", isOn: $settings.showsArtist)
-                Toggle("Show album", isOn: $settings.showsAlbum)
-            }
-
-            Section("Font") {
-                Picker("Typeface", selection: $settings.fontName) {
-                    Text("System").tag("System")
-                    Text("Condensed").tag("Condensed")
-                    Text("Monospaced").tag("Monospaced")
-                    Text("Rounded").tag("Rounded")
+                SettingsCard("Type") {
+                    SettingsRow("Typeface") {
+                        Picker("", selection: $settings.fontName) {
+                            Text("System").tag("System")
+                            Text("Condensed").tag("Condensed")
+                            Text("Monospaced").tag("Monospaced")
+                            Text("Rounded").tag("Rounded")
+                        }
+                        .labelsHidden()
+                        .frame(width: 150)
+                    }
+                    SettingsDivider()
+                    SliderRow(title: "Size", value: $settings.fontSize,
+                              range: 9...18, format: "%.0f pt")
                 }
-                SliderRow(title: "Size", value: $settings.fontSize, range: 9...18, format: "%.0f pt")
-            }
 
-            Section("Motion") {
-                Picker("Direction", selection: $settings.scrollDirection) {
-                    Text("Left").tag(0); Text("Right").tag(1)
+                SettingsCard("Motion") {
+                    SettingsRow("Direction") {
+                        Picker("", selection: $settings.scrollDirection) {
+                            Text("Left").tag(0)
+                            Text("Right").tag(1)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 190)
+                    }
+                    .modifier(Applies(when: scrolls))
+                    SettingsDivider()
+                    SliderRow(title: "Scroll speed", value: $settings.scrollSpeed,
+                              range: 0.5...10, format: "%.1f ch/s")
+                        .modifier(Applies(when: scrolls))
+                    SettingsDivider()
+                    SliderRow(title: "Page interval", value: $settings.pageInterval,
+                              range: 1...10, format: "%.1f s")
+                        .modifier(Applies(when: pages))
                 }
-                .pickerStyle(.segmented)
-                SliderRow(title: "Scroll speed", value: $settings.scrollSpeed, range: 0.5...10, format: "%.1f chars/s")
-                SliderRow(title: "Page interval", value: $settings.pageInterval, range: 1...10, format: "%.1f s")
+
             }
+            .padding(.horizontal, 20)
+
+            // The button belongs to the window rather than to the last card,
+            // so it sits on the bottom edge instead of trailing the Motion
+            // rows. Trailing the cards it also ran a few points past the
+            // bottom of the window and lost its lower edge.
+            Spacer(minLength: 20)
 
             HStack {
                 Spacer()
                 Button("Reset to Defaults") { settings.reset() }
+                    .controlSize(.regular)
+                    // Its own width, never the squeezed one: the title is
+                    // what decides how wide the button is.
+                    .fixedSize()
             }
-            }
-            .padding(20)
-
-            Spacer(minLength: 0)
+            .padding(.horizontal, 20)
+            .padding(.bottom, 18)
         }
-        // Pinned to the top: left to itself the stack centres in the frame,
-        // which pushed the heading half an inch down and below the traffic
-        // lights instead of level with them.
-        .frame(width: 380, height: 580, alignment: .top)
+        .frame(width: Self.windowSize.width, height: Self.windowSize.height)
         // No background of its own: the blur layer beneath the hosting view
         // is what paints this window, and an opaque fill here would hide it.
         // Nor is a scheme forced, unlike the panels in the other two apps —
         // this is a plain system surface and follows the system's light and
         // dark.
+    }
+
+}
+
+/// A titled group of rows on one rounded surface.
+private struct SettingsCard<Content: View>: View {
+    private let title: String
+    private let content: Content
+
+    init(_ title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 4)
+            VStack(spacing: 0) { content }
+                // Translucent rather than filled: the card sits on the
+                // window's blur and should let it through.
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.primary.opacity(0.06))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.07))
+                )
+        }
+    }
+}
+
+/// One row: a label at the leading edge, its control at the trailing one.
+private struct SettingsRow<Control: View>: View {
+    private let title: String
+    private let control: Control
+
+    init(_ title: String, @ViewBuilder control: () -> Control) {
+        self.title = title
+        self.control = control()
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text(title).font(.system(size: 13))
+            Spacer(minLength: 8)
+            control
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 36)
+    }
+}
+
+/// The hairline between rows, inset from the leading edge the way the system
+/// insets its own so it reads as a break in one surface, not a border.
+private struct SettingsDivider: View {
+    var body: some View {
+        Divider().opacity(0.45).padding(.leading, 12)
+    }
+}
+
+/// Dims and disables a row that the current display mode does not use.
+private struct Applies: ViewModifier {
+    let when: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .disabled(!when)
+            .opacity(when ? 1 : 0.4)
     }
 }
 
@@ -562,10 +955,16 @@ private struct SliderRow: View {
     let format: String
 
     var body: some View {
-        HStack {
-            Text(title)
-            Slider(value: $value, in: range)
-            Text(String(format: format, value)).frame(width: 76, alignment: .trailing)
+        SettingsRow(title) {
+            HStack(spacing: 10) {
+                Slider(value: $value, in: range).frame(width: 132)
+                // Fixed width and lining figures: without them the row
+                // twitched sideways as the digits changed.
+                Text(String(format: format, value))
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 48, alignment: .trailing)
+            }
         }
     }
 }
