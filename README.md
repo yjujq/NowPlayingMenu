@@ -6,8 +6,8 @@ When no media is playing, the Status Bar item automatically shrinks to the size 
 
 Choose `Settings…` from the Status Bar menu to customize the display. The panel groups its rows into cards over the
 window's blur. Settings include static, scrolling, or paged text; width; alignment; artist and album visibility;
-system, condensed, monospaced, or rounded fonts; font size; scrolling direction and speed; page interval; and a
-one-click reset. The Motion rows that the current mode does not use are dimmed rather than hidden, so the panel keeps
+system, condensed, monospaced, or rounded fonts; font size; the progress rule; scrolling direction and speed; page
+interval; and a one-click reset. The Motion rows that the current mode does not use are dimmed rather than hidden, so the panel keeps
 its shape. Settings are saved automatically.
 
 The line is a layer inside the Status Bar item rather than the button's title, so it moves by fractions of a point
@@ -20,6 +20,18 @@ copy of it are drawn on a single strip, and the strip slides by exactly one loop
 having — every change to the content of a status item makes AppKit re-snapshot the whole item, and thirty frames a
 second cost a quarter of a core. Animated as a layer it costs nothing per frame: the app is never woken for a frame,
 and its timer only wakes twice a second to notice a new track, a changed setting, or the menu bar turning dark.
+
+Under the line runs a hairline showing how far into the track playback has come — the whole track behind it, the part
+already played over it. It is animated rather than advanced on a timer, for the same reason the line is: the render
+server is told once where the rule stands and when it should reach the end of the track, and draws every frame of it
+without waking the app. A poll every five seconds is enough to catch a seek, a pause or a new track, and the rule is
+re-aimed only when the reading the system publishes actually changes.
+
+The reading is not a live position. The system writes down where the track was at a timestamp and leaves it there
+until playback changes, so the current position is carried forward from that pair. The rule needs a duration as well,
+and **not every source publishes one** — a video playing in a browser often publishes a position and no duration at
+all. There is then no fraction to draw and the rule stays hidden; the line above it is unaffected. Turn the rule off
+altogether with `Show progress` in Settings.
 
 Left-click the Status Bar display to toggle the system Play/Pause command. Right-click it — a two-finger click on a
 trackpad — to open the menu. It opens on a header carrying the playback state, the track title, and the artist and

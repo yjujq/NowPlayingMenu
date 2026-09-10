@@ -21,11 +21,25 @@ if (!cls) {
       const value = info.objectForKey($(key));
       return value && !value.isNil() ? ObjC.unwrap(value) : null;
     };
+    // Отметка времени приходит как NSDate. Разворачивать её незачем — нужен
+    // один момент в секундах, от которого продолжается отсчёт позиции.
+    const moment = (key) => {
+      if (!info || info.isNil()) return null;
+      const value = info.objectForKey($(key));
+      return value && !value.isNil() ? value.timeIntervalSince1970 : null;
+    };
     reply({
       title: get("kMRMediaRemoteNowPlayingInfoTitle"),
       artist: get("kMRMediaRemoteNowPlayingInfoArtist"),
       album: get("kMRMediaRemoteNowPlayingInfoAlbum"),
-      playbackRate: get("kMRMediaRemoteNowPlayingInfoPlaybackRate") || 0
+      playbackRate: get("kMRMediaRemoteNowPlayingInfoPlaybackRate") || 0,
+      // Позиция — не текущая, а та, что была на момент timestamp: система
+      // переписывает её только когда воспроизведение меняется, поэтому
+      // между опросами её досчитывают сами. Длительность публикует не
+      // всякий источник; без неё показывать нечего.
+      duration: get("kMRMediaRemoteNowPlayingInfoDuration") || 0,
+      elapsedTime: get("kMRMediaRemoteNowPlayingInfoElapsedTime") || 0,
+      timestamp: moment("kMRMediaRemoteNowPlayingInfoTimestamp")
     });
   }
 }

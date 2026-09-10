@@ -36,6 +36,38 @@ final class NowPlayingModel: ObservableObject {
     /// Whether there is a track at all. Differs from isPlaying: while paused
     /// a track exists but nothing plays — and the title must stay on screen.
     @Published private(set) var hasTrack = false
+    /// Where the track stands, when the source says how long it is. Nil when
+    /// it does not: a good many of them publish a position and no duration,
+    /// and a fraction of an unknown whole is not something that can be drawn.
+    @Published private(set) var progress: Progress?
+
+    /// A reading of the position, not the position itself.
+    ///
+    /// The system does not count the seconds out; it writes down where the
+    /// track was at `taken` and leaves it there until playback changes. So a
+    /// reading stays the same across polls — which is what makes it worth
+    /// comparing — and the current position is carried forward from it.
+    struct Progress: Equatable {
+        /// Seconds into the track, as of `taken`.
+        let reading: Double
+        let taken: Date
+        let duration: Double
+        /// 1 while playing, 0 while paused. The reading stands still at 0.
+        let rate: Double
+
+        func elapsed(at moment: Date) -> Double {
+            let carried = reading + moment.timeIntervalSince(taken) * rate
+            return min(max(carried, 0), duration)
+        }
+
+        func fraction(at moment: Date) -> Double {
+            duration > 0 ? elapsed(at: moment) / duration : 0
+        }
+
+        func remaining(at moment: Date) -> Double {
+            max(duration - elapsed(at: moment), 0)
+        }
+    }
 
     var displayText: String {
         guard hasTrack else { return "Nothing playing" }
@@ -84,9 +116,26 @@ final class NowPlayingModel: ObservableObject {
         artist = info["artist"] as? String ?? ""
         album = info["album"] as? String ?? ""
         artwork = nil
+        progress = Self.progress(from: info, playbackRate: playbackRate, hasTrack: hasTrack)
         schedulePolling()
     }
 
+    /// Falls back to now for the timestamp, which every source seen so far
+    /// does send. Without one the reading can only be taken as current, and
+    /// it is then a new reading every poll — so the display re-syncs each
+    /// time rather than running smoothly between polls.
+    private static func progress(from info: [String: Any],
+                                 playbackRate: Double, hasTrack: Bool) -> Progress? {
+        let duration = (info["duration"] as? NSNumber)?.doubleValue ?? 0
+        guard hasTrack, duration > 0 else { return nil }
+        let taken = (info["timestamp"] as? NSNumber).map {
+            Date(timeIntervalSince1970: $0.doubleValue)
+        }
+        return Progress(reading: (info["elapsedTime"] as? NSNumber)?.doubleValue ?? 0,
+                        taken: taken ?? Date(),
+                        duration: duration,
+                        rate: playbackRate)
+    }
 }
 
 @MainActor
@@ -97,6 +146,7 @@ final class DisplaySettings: ObservableObject {
     @Published var fontSize: Double { didSet { save("fontSize", fontSize) } }
     @Published var showsArtist: Bool { didSet { save("showsArtist", showsArtist) } }
     @Published var showsAlbum: Bool { didSet { save("showsAlbum", showsAlbum) } }
+    @Published var showsProgress: Bool { didSet { save("showsProgress", showsProgress) } }
     @Published var alignment: Int { didSet { save("alignment", alignment) } }
     @Published var scrollDirection: Int { didSet { save("scrollDirection", scrollDirection) } }
     @Published var scrollSpeed: Double { didSet { save("scrollSpeed", scrollSpeed) } }
@@ -112,6 +162,7 @@ final class DisplaySettings: ObservableObject {
         fontSize = defaults.object(forKey: "fontSize") as? Double ?? 13
         showsArtist = defaults.object(forKey: "showsArtist") as? Bool ?? true
         showsAlbum = defaults.object(forKey: "showsAlbum") as? Bool ?? false
+        showsProgress = defaults.object(forKey: "showsProgress") as? Bool ?? true
         alignment = defaults.object(forKey: "alignment") as? Int ?? 0
         scrollDirection = defaults.object(forKey: "scrollDirection") as? Int ?? 0
         scrollSpeed = defaults.object(forKey: "scrollSpeed") as? Double ?? 3
@@ -120,7 +171,7 @@ final class DisplaySettings: ObservableObject {
 
     func reset() {
         displayMode = 0; width = 167; fontName = "System"; fontSize = 13
-        showsArtist = true; showsAlbum = false; alignment = 0
+        showsArtist = true; showsAlbum = false; showsProgress = true; alignment = 0
         scrollDirection = 0; scrollSpeed = 3; pageInterval = 2
     }
 
@@ -197,6 +248,20 @@ private final class MarqueeStatusItem: NSObject {
     private static let loopGap: CGFloat = 28
     private static let motionKey = "marquee"
 
+    /// The progress rule along the bottom of the item: the whole track behind,
+    /// the part already played over it.
+    ///
+    /// A point tall and a point and a half up from the bottom. Both numbers
+    /// are what a menu bar of 22 points leaves: the line is drawn centred in
+    /// it and its descenders reach three points from the bottom, so a rule
+    /// any thicker or any higher is struck through by every g and y. Moving
+    /// the line up to make room was tried and is worse — it lifts the title a
+    /// visible step above the clock and everything else in the bar, and the
+    /// step appears and disappears with the setting.
+    private static let progressHeight: CGFloat = 1
+    private static let progressInset: CGFloat = 1.5
+    private static let progressKey = "progress"
+
     /// The line lives in a layer of its own inside the button, and moves by a
     /// Core Animation handed to the render server once.
     ///
@@ -208,6 +273,8 @@ private final class MarqueeStatusItem: NSObject {
     /// core; the same line as an animated layer costs nothing per frame,
     /// because the app is not woken for the frames at all.
     private let lineLayer = CALayer()
+    private let progressTrack = CALayer()
+    private let progressLayer = CALayer()
 
     /// The line, measured and rasterised: the text twice over, one loop apart,
     /// on a single transparent strip. Frames are windows onto this strip.
@@ -303,6 +370,12 @@ private final class MarqueeStatusItem: NSObject {
     /// Whether it was playing on the previous tick. The change marks the
     /// exact moment playback was paused.
     private var wasPlaying = false
+    /// The reading the rule was last animated from, and the width it was
+    /// animated across. A reading stays the same between polls, so this is
+    /// what keeps the animation from being handed over again for nothing.
+    private var installedProgress: NowPlayingModel.Progress?
+    private var installedProgressWidth: CGFloat = 0
+    private var progressAppearance: NSAppearance.Name?
     private var settingsWatch: AnyCancellable?
     private var timer: Timer?
 
@@ -335,6 +408,15 @@ private final class MarqueeStatusItem: NSObject {
             "contents": NSNull(), "hidden": NSNull()
         ]
         button.layer?.addSublayer(lineLayer)
+        for layer in [progressTrack, progressLayer] {
+            layer.anchorPoint = .zero
+            layer.actions = [
+                "position": NSNull(), "bounds": NSNull(),
+                "backgroundColor": NSNull(), "hidden": NSNull()
+            ]
+            layer.isHidden = true
+            button.layer?.addSublayer(layer)
+        }
 
         rescheduleTimer()
         tick()
@@ -380,6 +462,7 @@ private final class MarqueeStatusItem: NSObject {
                 moving = false
                 lineLayer.removeAnimation(forKey: Self.motionKey)
                 lineLayer.contents = nil
+                hideProgress()
                 button.title = ""
                 button.attributedTitle = NSAttributedString(string: "")
                 button.image = Self.idleImage
@@ -399,8 +482,11 @@ private final class MarqueeStatusItem: NSObject {
             button.wantsLayer = true
             button.layer?.masksToBounds = true
             button.layer?.addSublayer(lineLayer)
+            button.layer?.addSublayer(progressTrack)
+            button.layer?.addSublayer(progressLayer)
             shown = .nothing
             motion = nil
+            installedProgress = nil
         }
 
         let scale = button.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
@@ -442,6 +528,7 @@ private final class MarqueeStatusItem: NSObject {
         }
 
         moving = player.isPlaying && !fits && settings.displayMode != 0
+        updateProgress(width: available, appearance: appearance)
         let y = ((button.bounds.height - line.height) / 2).rounded()
 
         switch settings.displayMode {
@@ -507,6 +594,72 @@ private final class MarqueeStatusItem: NSObject {
         lineLayer.bounds = CGRect(x: 0, y: 0, width: width, height: line.height)
         lineLayer.contents = still?.image
         shown = .still(width: width, alignment: alignment)
+    }
+
+    /// The rule under the line: how far into the track playback has come.
+    ///
+    /// Animated rather than redrawn, for the reason the line above it is:
+    /// every change to the content of a status item makes AppKit re-snapshot
+    /// the whole item, so a rule advanced on a timer costs what the scrolling
+    /// line used to cost. The render server is instead told once where the
+    /// rule stands and when it should reach the end, and draws every frame of
+    /// it without waking the app — which is also why the poll can stay at
+    /// five seconds while the rule moves smoothly between polls.
+    private func updateProgress(width: CGFloat, appearance: NSAppearance) {
+        guard settings.showsProgress, let progress = player.progress else {
+            hideProgress()
+            return
+        }
+        if progressAppearance != appearance.name {
+            // The track is the line's own colour worn thin rather than a grey
+            // of its own: it has to stay quiet against the menu bar whatever
+            // the desktop picture puts behind it.
+            let colour = Self.textColor(for: appearance)
+            progressTrack.backgroundColor = colour.withAlphaComponent(0.3).cgColor
+            progressLayer.backgroundColor = colour.cgColor
+            progressAppearance = appearance.name
+        }
+        progressTrack.isHidden = false
+        progressLayer.isHidden = false
+        let frame = CGRect(x: 0, y: Self.progressInset,
+                           width: width, height: Self.progressHeight)
+        if progressTrack.frame != frame { progressTrack.frame = frame }
+        progressLayer.position = CGPoint(x: 0, y: Self.progressInset)
+        if installedProgress != progress || installedProgressWidth != width {
+            installedProgress = progress
+            installedProgressWidth = width
+            installProgress(progress, width: width)
+        }
+    }
+
+    private func installProgress(_ progress: NowPlayingModel.Progress, width: CGFloat) {
+        progressLayer.removeAnimation(forKey: Self.progressKey)
+        let now = Date()
+        let reached = (width * progress.fraction(at: now)).rounded()
+        let remaining = progress.remaining(at: now)
+        // A track paused, or within a moment of its end, is not going
+        // anywhere: the rule stands where it stands.
+        let running = progress.rate > 0 && remaining > 0.5
+        // The end of the animation is the layer's own value, so when it
+        // finishes there is nothing to put back and nothing to notice.
+        progressLayer.bounds = CGRect(x: 0, y: 0, width: running ? width : reached,
+                                      height: Self.progressHeight)
+        guard running else { return }
+        let animation = CABasicAnimation(keyPath: "bounds.size.width")
+        animation.fromValue = reached
+        animation.toValue = width
+        animation.duration = remaining / progress.rate
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.isRemovedOnCompletion = false
+        progressLayer.add(animation, forKey: Self.progressKey)
+    }
+
+    private func hideProgress() {
+        guard !progressTrack.isHidden else { return }
+        progressLayer.removeAnimation(forKey: Self.progressKey)
+        progressTrack.isHidden = true
+        progressLayer.isHidden = true
+        installedProgress = nil
     }
 
     private func stopMotion() {
@@ -752,7 +905,7 @@ private final class MarqueeStatusItem: NSObject {
 private struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
 
-    static let windowSize = CGSize(width: 400, height: 604)
+    static let windowSize = CGSize(width: 400, height: 641)
 
     /// Scrolling and paging each use a different half of the Motion card.
     /// Rather than hide the rows that do not apply — which would make the
@@ -807,6 +960,10 @@ private struct SettingsView: View {
                     SettingsDivider()
                     SettingsRow("Show album") {
                         Toggle("", isOn: $settings.showsAlbum).labelsHidden().toggleStyle(.switch)
+                    }
+                    SettingsDivider()
+                    SettingsRow("Show progress") {
+                        Toggle("", isOn: $settings.showsProgress).labelsHidden().toggleStyle(.switch)
                     }
                 }
 
