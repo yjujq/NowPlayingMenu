@@ -621,15 +621,30 @@ private final class MarqueeStatusItem: NSObject {
         }
         progressTrack.isHidden = false
         progressLayer.isHidden = false
-        let frame = CGRect(x: 0, y: Self.progressInset,
-                           width: width, height: Self.progressHeight)
+        let y = progressY
+        let frame = CGRect(x: 0, y: y, width: width, height: Self.progressHeight)
         if progressTrack.frame != frame { progressTrack.frame = frame }
-        progressLayer.position = CGPoint(x: 0, y: Self.progressInset)
+        progressLayer.position = CGPoint(x: 0, y: y)
         if installedProgress != progress || installedProgressWidth != width {
             installedProgress = progress
             installedProgressWidth = width
             installProgress(progress, width: width)
         }
+    }
+
+    /// Where the rule sits, in the coordinates its layer is placed in.
+    ///
+    /// A status item button is flipped, and AppKit marks its backing layer's
+    /// geometry to match, so a sublayer's origin is the top-left corner and
+    /// not the bottom-left one. The line above it never noticed: it is
+    /// centred, and a centred thing reads the same either way. The rule, an
+    /// inset from the bottom, went to the top of the bar instead — above the
+    /// title rather than under it.
+    private var progressY: CGFloat {
+        guard let button = statusItem.button else { return Self.progressInset }
+        let flipped = button.layer?.isGeometryFlipped ?? button.isFlipped
+        guard flipped else { return Self.progressInset }
+        return button.bounds.height - Self.progressInset - Self.progressHeight
     }
 
     private func installProgress(_ progress: NowPlayingModel.Progress, width: CGFloat) {
