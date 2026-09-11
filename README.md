@@ -21,8 +21,10 @@ having — every change to the content of a status item makes AppKit re-snapshot
 second cost a quarter of a core. Animated as a layer it costs nothing per frame: the app is never woken for a frame,
 and its timer only wakes twice a second to notice a new track, a changed setting, or the menu bar turning dark.
 
-Under the line runs a hairline showing how far into the track playback has come — the whole track behind it, the part
-already played over it. It is animated rather than advanced on a timer, for the same reason the line is: the render
+Under the line runs a hairline showing how far into the track playback has come: it reaches as far across the item as
+the track has been played, and nothing is drawn for the part still to come. A faint rule behind it was tried and reads
+as a border on the item rather than as a measure of the track — it underlines the title whether or not anything is
+playing, and what is left says the same thing by its length alone. It is animated rather than advanced on a timer, for the same reason the line is: the render
 server is told once where the rule stands and when it should reach the end of the track, and draws every frame of it
 without waking the app. A poll every five seconds is enough to catch a seek, a pause or a new track, and the rule is
 re-aimed only when the reading the system publishes actually changes.

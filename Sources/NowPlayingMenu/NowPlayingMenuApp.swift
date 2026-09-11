@@ -248,8 +248,8 @@ private final class MarqueeStatusItem: NSObject {
     private static let loopGap: CGFloat = 28
     private static let motionKey = "marquee"
 
-    /// The progress rule along the bottom of the item: the whole track behind,
-    /// the part already played over it.
+    /// The progress rule along the bottom of the item: as long a part of the
+    /// item's width as the track has been played.
     ///
     /// A point tall and a point and a half up from the bottom. Both numbers
     /// are what a menu bar of 22 points leaves: the line is drawn centred in
@@ -273,7 +273,6 @@ private final class MarqueeStatusItem: NSObject {
     /// core; the same line as an animated layer costs nothing per frame,
     /// because the app is not woken for the frames at all.
     private let lineLayer = CALayer()
-    private let progressTrack = CALayer()
     private let progressLayer = CALayer()
 
     /// The line, measured and rasterised: the text twice over, one loop apart,
@@ -408,15 +407,13 @@ private final class MarqueeStatusItem: NSObject {
             "contents": NSNull(), "hidden": NSNull()
         ]
         button.layer?.addSublayer(lineLayer)
-        for layer in [progressTrack, progressLayer] {
-            layer.anchorPoint = .zero
-            layer.actions = [
-                "position": NSNull(), "bounds": NSNull(),
-                "backgroundColor": NSNull(), "hidden": NSNull()
-            ]
-            layer.isHidden = true
-            button.layer?.addSublayer(layer)
-        }
+        progressLayer.anchorPoint = .zero
+        progressLayer.actions = [
+            "position": NSNull(), "bounds": NSNull(),
+            "backgroundColor": NSNull(), "hidden": NSNull()
+        ]
+        progressLayer.isHidden = true
+        button.layer?.addSublayer(progressLayer)
 
         rescheduleTimer()
         tick()
@@ -482,7 +479,6 @@ private final class MarqueeStatusItem: NSObject {
             button.wantsLayer = true
             button.layer?.masksToBounds = true
             button.layer?.addSublayer(lineLayer)
-            button.layer?.addSublayer(progressTrack)
             button.layer?.addSublayer(progressLayer)
             shown = .nothing
             motion = nil
@@ -598,6 +594,12 @@ private final class MarqueeStatusItem: NSObject {
 
     /// The rule under the line: how far into the track playback has come.
     ///
+    /// Only the part played is drawn. The rest of the track was drawn behind
+    /// it for a while, worn thin, and a faint rule the full width of the item
+    /// underlines the title whether or not anything is playing — it reads as
+    /// a border on the item rather than as a measure of the track. What is
+    /// left says the same thing by its length alone.
+    ///
     /// Animated rather than redrawn, for the reason the line above it is:
     /// every change to the content of a status item makes AppKit re-snapshot
     /// the whole item, so a rule advanced on a timer costs what the scrolling
@@ -611,20 +613,14 @@ private final class MarqueeStatusItem: NSObject {
             return
         }
         if progressAppearance != appearance.name {
-            // The track is the line's own colour worn thin rather than a grey
-            // of its own: it has to stay quiet against the menu bar whatever
-            // the desktop picture puts behind it.
-            let colour = Self.textColor(for: appearance)
-            progressTrack.backgroundColor = colour.withAlphaComponent(0.3).cgColor
-            progressLayer.backgroundColor = colour.cgColor
+            // The line's own colour, so the rule belongs to the title above it
+            // and not to the menu bar: it has to hold whatever the desktop
+            // picture puts behind the bar, the way the title does.
+            progressLayer.backgroundColor = Self.textColor(for: appearance).cgColor
             progressAppearance = appearance.name
         }
-        progressTrack.isHidden = false
         progressLayer.isHidden = false
-        let y = progressY
-        let frame = CGRect(x: 0, y: y, width: width, height: Self.progressHeight)
-        if progressTrack.frame != frame { progressTrack.frame = frame }
-        progressLayer.position = CGPoint(x: 0, y: y)
+        progressLayer.position = CGPoint(x: 0, y: progressY)
         if installedProgress != progress || installedProgressWidth != width {
             installedProgress = progress
             installedProgressWidth = width
@@ -670,9 +666,8 @@ private final class MarqueeStatusItem: NSObject {
     }
 
     private func hideProgress() {
-        guard !progressTrack.isHidden else { return }
+        guard !progressLayer.isHidden else { return }
         progressLayer.removeAnimation(forKey: Self.progressKey)
-        progressTrack.isHidden = true
         progressLayer.isHidden = true
         installedProgress = nil
     }
