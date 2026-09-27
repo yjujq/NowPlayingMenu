@@ -246,6 +246,8 @@ private final class MarqueeStatusItem: NSObject {
     /// The clear space between the end of the line and the copy of it that
     /// follows, so a loop does not read as one run-on sentence.
     private static let loopGap: CGFloat = 28
+    /// How long the line takes to cross from light to dark and back.
+    private static let themeFade: CFTimeInterval = 0.6
     private static let motionKey = "marquee"
 
     /// The progress rule along the bottom of the item: as long a part of the
@@ -376,6 +378,9 @@ private final class MarqueeStatusItem: NSObject {
     private var installedProgressWidth: CGFloat = 0
     private var progressAppearance: NSAppearance.Name?
     private var settingsWatch: AnyCancellable?
+    /// The bar turning light or dark is answered at once, not on the next
+    /// tick: half a second late, the fade would start from a blink.
+    private var appearanceWatch: NSKeyValueObservation?
     private var timer: Timer?
 
     /// The idle icon is built once. Rebuilding it from a system symbol on
@@ -421,6 +426,10 @@ private final class MarqueeStatusItem: NSObject {
         // Settings is an observable object, so the display adapts the moment
         // a value changes rather than on the next tick. The notification
         // arrives BEFORE the new value is stored, so we read it one turn later.
+        appearanceWatch = button.observe(\.effectiveAppearance) { [weak self] _, _ in
+            DispatchQueue.main.async { self?.tick() }
+        }
+
         settingsWatch = settings.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.tick() }
         }
@@ -489,15 +498,27 @@ private final class MarqueeStatusItem: NSObject {
         let appearance = button.effectiveAppearance
         let font = settings.font()
         let text = player.displayText
-        if line?.text != text || line?.font != font
-            || line?.appearance != appearance.name || line?.scale != scale {
+        let sameLine = line?.text == text && line?.font == font && line?.scale == scale
+        if !sameLine || line?.appearance != appearance.name {
+            let themeOnly = sameLine && line != nil
             line = Line(text: text, font: font, gap: Self.loopGap, scale: scale,
                         color: Self.textColor(for: appearance), appearance: appearance.name)
             still = nil
-            motion = nil
             shown = .nothing
-            page = 0
-            lastPageChange = .distantPast
+            if themeOnly {
+                // The bar went light or dark — a change of space, of desktop
+                // picture, of the system theme. The line is the same line in
+                // another colour: it keeps its place in the loop and fades
+                // across, the way the bar itself does, instead of blinking.
+                let fade = CATransition()
+                fade.type = .fade
+                fade.duration = Self.themeFade
+                lineLayer.add(fade, forKey: "theme")
+            } else {
+                motion = nil
+                page = 0
+                lastPageChange = .distantPast
+            }
         }
         guard let line else { return }
 
@@ -616,7 +637,15 @@ private final class MarqueeStatusItem: NSObject {
             // The line's own colour, so the rule belongs to the title above it
             // and not to the menu bar: it has to hold whatever the desktop
             // picture puts behind the bar, the way the title does.
-            progressLayer.backgroundColor = Self.textColor(for: appearance).cgColor
+            let color = Self.textColor(for: appearance).cgColor
+            if progressAppearance != nil, !progressLayer.isHidden {
+                let fade = CABasicAnimation(keyPath: "backgroundColor")
+                fade.fromValue = progressLayer.backgroundColor
+                fade.toValue = color
+                fade.duration = Self.themeFade
+                progressLayer.add(fade, forKey: "theme")
+            }
+            progressLayer.backgroundColor = color
             progressAppearance = appearance.name
         }
         progressLayer.isHidden = false
