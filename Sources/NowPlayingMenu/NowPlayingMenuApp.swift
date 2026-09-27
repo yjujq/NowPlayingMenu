@@ -246,8 +246,6 @@ private final class MarqueeStatusItem: NSObject {
     /// The clear space between the end of the line and the copy of it that
     /// follows, so a loop does not read as one run-on sentence.
     private static let loopGap: CGFloat = 28
-    /// How long the line takes to cross from light to dark and back.
-    private static let themeFade: CFTimeInterval = 0.6
     private static let motionKey = "marquee"
 
     /// The progress rule along the bottom of the item: as long a part of the
@@ -274,8 +272,16 @@ private final class MarqueeStatusItem: NSObject {
     /// three milliseconds a time. Thirty frames a second cost a quarter of a
     /// core; the same line as an animated layer costs nothing per frame,
     /// because the app is not woken for the frames at all.
+    ///
+    /// Neither layer carries a colour. Each is the mask of a view that fills
+    /// itself with the menu bar's text colour, and AppKit repaints that view in
+    /// the same pass as every other item on the bar — so when the bar turns
+    /// light or dark, the line turns with the icons beside it instead of
+    /// catching up on the next tick with a blink.
     private let lineLayer = CALayer()
     private let progressLayer = CALayer()
+    private let lineFill = BarTextFill()
+    private let progressFill = BarTextFill()
 
     /// The line, measured and rasterised: the text twice over, one loop apart,
     /// on a single transparent strip. Frames are windows onto this strip.
@@ -376,11 +382,7 @@ private final class MarqueeStatusItem: NSObject {
     /// what keeps the animation from being handed over again for nothing.
     private var installedProgress: NowPlayingModel.Progress?
     private var installedProgressWidth: CGFloat = 0
-    private var progressAppearance: NSAppearance.Name?
     private var settingsWatch: AnyCancellable?
-    /// The bar turning light or dark is answered at once, not on the next
-    /// tick: half a second late, the fade would start from a blink.
-    private var appearanceWatch: NSKeyValueObservation?
     private var timer: Timer?
 
     /// The idle icon is built once. Rebuilding it from a system symbol on
@@ -411,14 +413,16 @@ private final class MarqueeStatusItem: NSObject {
             "position": NSNull(), "bounds": NSNull(),
             "contents": NSNull(), "hidden": NSNull()
         ]
-        button.layer?.addSublayer(lineLayer)
+        attach(lineFill, mask: lineLayer, to: button)
         progressLayer.anchorPoint = .zero
         progressLayer.actions = [
             "position": NSNull(), "bounds": NSNull(),
             "backgroundColor": NSNull(), "hidden": NSNull()
         ]
+        progressLayer.backgroundColor = NSColor.black.cgColor
         progressLayer.isHidden = true
-        button.layer?.addSublayer(progressLayer)
+        progressFill.isHidden = true
+        attach(progressFill, mask: progressLayer, to: button)
 
         rescheduleTimer()
         tick()
@@ -426,10 +430,6 @@ private final class MarqueeStatusItem: NSObject {
         // Settings is an observable object, so the display adapts the moment
         // a value changes rather than on the next tick. The notification
         // arrives BEFORE the new value is stored, so we read it one turn later.
-        appearanceWatch = button.observe(\.effectiveAppearance) { [weak self] _, _ in
-            DispatchQueue.main.async { self?.tick() }
-        }
-
         settingsWatch = settings.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.tick() }
         }
@@ -484,41 +484,30 @@ private final class MarqueeStatusItem: NSObject {
             idleApplied = false
         }
 
-        if lineLayer.superlayer !== button.layer {
+        if lineFill.superview !== button {
             button.wantsLayer = true
             button.layer?.masksToBounds = true
-            button.layer?.addSublayer(lineLayer)
-            button.layer?.addSublayer(progressLayer)
+            attach(lineFill, mask: lineLayer, to: button)
+            attach(progressFill, mask: progressLayer, to: button)
             shown = .nothing
             motion = nil
             installedProgress = nil
         }
 
         let scale = button.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        let appearance = button.effectiveAppearance
+        // Drawn in black: only the shape of the line matters to a mask.
+        let appearance = NSAppearance(named: .aqua)!
         let font = settings.font()
         let text = player.displayText
-        let sameLine = line?.text == text && line?.font == font && line?.scale == scale
-        if !sameLine || line?.appearance != appearance.name {
-            let themeOnly = sameLine && line != nil
+        if line?.text != text || line?.font != font
+            || line?.appearance != appearance.name || line?.scale != scale {
             line = Line(text: text, font: font, gap: Self.loopGap, scale: scale,
-                        color: Self.textColor(for: appearance), appearance: appearance.name)
+                        color: .black, appearance: appearance.name)
             still = nil
+            motion = nil
             shown = .nothing
-            if themeOnly {
-                // The bar went light or dark — a change of space, of desktop
-                // picture, of the system theme. The line is the same line in
-                // another colour: it keeps its place in the loop and fades
-                // across, the way the bar itself does, instead of blinking.
-                let fade = CATransition()
-                fade.type = .fade
-                fade.duration = Self.themeFade
-                lineLayer.add(fade, forKey: "theme")
-            } else {
-                motion = nil
-                page = 0
-                lastPageChange = .distantPast
-            }
+            page = 0
+            lastPageChange = .distantPast
         }
         guard let line else { return }
 
@@ -598,7 +587,7 @@ private final class MarqueeStatusItem: NSObject {
             paragraph.alignment = [.left, .center, .right][min(max(alignment, 0), 2)]
             let string = NSAttributedString(string: line.text, attributes: [
                 .font: line.font,
-                .foregroundColor: Self.textColor(for: NSAppearance(named: line.appearance) ?? .currentDrawing()),
+                .foregroundColor: NSColor.black,
                 .paragraphStyle: paragraph
             ])
             let height = ceil(string.size().height)
@@ -633,22 +622,8 @@ private final class MarqueeStatusItem: NSObject {
             hideProgress()
             return
         }
-        if progressAppearance != appearance.name {
-            // The line's own colour, so the rule belongs to the title above it
-            // and not to the menu bar: it has to hold whatever the desktop
-            // picture puts behind the bar, the way the title does.
-            let color = Self.textColor(for: appearance).cgColor
-            if progressAppearance != nil, !progressLayer.isHidden {
-                let fade = CABasicAnimation(keyPath: "backgroundColor")
-                fade.fromValue = progressLayer.backgroundColor
-                fade.toValue = color
-                fade.duration = Self.themeFade
-                progressLayer.add(fade, forKey: "theme")
-            }
-            progressLayer.backgroundColor = color
-            progressAppearance = appearance.name
-        }
         progressLayer.isHidden = false
+        progressFill.isHidden = false
         progressLayer.position = CGPoint(x: 0, y: progressY)
         if installedProgress != progress || installedProgressWidth != width {
             installedProgress = progress
@@ -698,6 +673,7 @@ private final class MarqueeStatusItem: NSObject {
         guard !progressLayer.isHidden else { return }
         progressLayer.removeAnimation(forKey: Self.progressKey)
         progressLayer.isHidden = true
+        progressFill.isHidden = true
         installedProgress = nil
     }
 
@@ -728,14 +704,11 @@ private final class MarqueeStatusItem: NSObject {
         lineLayer.add(animation, forKey: Self.motionKey)
     }
 
-    /// The colour the menu bar draws its text in, resolved for the bar's own
-    /// appearance.
-    private static func textColor(for appearance: NSAppearance) -> NSColor {
-        var color = NSColor.labelColor
-        appearance.performAsCurrentDrawingAppearance {
-            color = NSColor.labelColor.usingColorSpace(.sRGB) ?? .labelColor
-        }
-        return color
+    private func attach(_ fill: BarTextFill, mask: CALayer, to button: NSView) {
+        fill.frame = button.bounds
+        fill.autoresizingMask = [.width, .height]
+        button.addSubview(fill)
+        fill.layer?.mask = mask
     }
 
     /// Draws into a bitmap `size` points across at `scale` pixels to the
@@ -1162,5 +1135,31 @@ private struct SliderRow: View {
                     .frame(width: 48, alignment: .trailing)
             }
         }
+    }
+}
+
+/// A view the colour of the menu bar's text, and nothing else. The line and
+/// the rule are its masks. Being a view, it is repainted by AppKit whenever
+/// the bar's appearance changes, together with the bar's own icons.
+private final class BarTextFill: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var isFlipped: Bool { true }
+    override var wantsUpdateLayer: Bool { true }
+    // Clicks belong to the button underneath.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func updateLayer() {
+        layer?.backgroundColor = NSColor.labelColor.cgColor
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
     }
 }
