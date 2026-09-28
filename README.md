@@ -37,3 +37,11 @@ swift run
 ```
 
 Or `./make-app.sh --install` to build the app into Applications.
+
+## Privacy
+
+Now Playing Menu collects nothing and makes no network connections. Track details are read from your own Mac and stay there.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
