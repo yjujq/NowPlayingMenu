@@ -1,11 +1,11 @@
-# Промежуточные файлы сборки Swift Package — 270 МБ, пересобираются
+# Swift Package build intermediates — 270 MB, rebuilt from source
 .build/
 .swiftpm/
 
-# Готовое приложение собирается скриптом
+# The finished app is built by the script
 NowPlayingMenu.app/
 
 .DS_Store
 
-# Собирается из AppIcon.iconset скриптом
+# Built from AppIcon.iconset by the script
 AppIcon.icns

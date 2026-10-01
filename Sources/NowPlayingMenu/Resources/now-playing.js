@@ -1,6 +1,6 @@
 ObjC.import("Foundation");
 
-// Приватный фреймворк грузим вручную: описаний мостов для него нет.
+// The private framework is loaded by hand: there are no bridge descriptions for it.
 $.NSBundle.bundleWithPath("/System/Library/PrivateFrameworks/MediaRemote.framework/").load;
 
 function reply(object) { return JSON.stringify(object); }
@@ -9,8 +9,8 @@ const cls = $.NSClassFromString("MRNowPlayingRequest");
 if (!cls) {
   reply({ error: "MRNowPlayingRequest not found" });
 } else {
-  // Методы класса, полученного по имени, вызываются только через селектор:
-  // обращение к ним как к свойствам даёт TypeError.
+  // Methods of a class looked up by name can only be called through a selector:
+  // accessing them as properties throws a TypeError.
   const item = cls.performSelector($.NSSelectorFromString("localNowPlayingItem"));
   // The app that is playing. Web audio is played by WebKit's GPU process on
   // behalf of a browser, and then the browser is the parent.
@@ -34,8 +34,8 @@ if (!cls) {
       const value = info.objectForKey($(key));
       return value && !value.isNil() ? ObjC.unwrap(value) : null;
     };
-    // Отметка времени приходит как NSDate. Разворачивать её незачем — нужен
-    // один момент в секундах, от которого продолжается отсчёт позиции.
+    // The timestamp arrives as an NSDate. No need to unwrap it: all that is
+    // needed is one moment in seconds to keep counting the position from.
     const moment = (key) => {
       if (!info || info.isNil()) return null;
       const value = info.objectForKey($(key));
@@ -46,10 +46,10 @@ if (!cls) {
       artist: get("kMRMediaRemoteNowPlayingInfoArtist"),
       album: get("kMRMediaRemoteNowPlayingInfoAlbum"),
       playbackRate: get("kMRMediaRemoteNowPlayingInfoPlaybackRate") || 0,
-      // Позиция — не текущая, а та, что была на момент timestamp: система
-      // переписывает её только когда воспроизведение меняется, поэтому
-      // между опросами её досчитывают сами. Длительность публикует не
-      // всякий источник; без неё показывать нечего.
+      // The position is not the current one but the one at the timestamp: the
+      // system rewrites it only when playback changes, so between polls we
+      // count it forward ourselves. Not every source publishes a duration;
+      // without one there is nothing to show.
       duration: get("kMRMediaRemoteNowPlayingInfoDuration") || 0,
       elapsedTime: get("kMRMediaRemoteNowPlayingInfoElapsedTime") || 0,
       timestamp: moment("kMRMediaRemoteNowPlayingInfoTimestamp"),
