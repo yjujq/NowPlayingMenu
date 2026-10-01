@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import Combine
 import MediaRemoteBridge
+import ApplicationServices
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -59,6 +60,176 @@ final class NowPlayingModel: ObservableObject {
     /// The bundle identifier of the app that is playing, for bringing it
     /// forward. A browser rather than WebKit when the sound is from the web.
     @Published private(set) var source: String?
+    /// Every player with something loaded, as the helper lists them — the
+    /// system's pick among them. Looked for only while the card is open.
+    @Published private(set) var listed: [Player] = []
+    /// Their pictures, by `Player.artworkKey`.
+    @Published private(set) var otherArtwork: [String: NSImage] = [:]
+    /// The player the card shows opened out, the rest folded.
+    @Published private(set) var openID: String?
+
+    /// One player, as the card shows it: the system's own pick — the one the
+    /// fields above describe — or one of the others.
+    struct Player: Identifiable, Equatable {
+        static let systemID = "system"
+
+        /// Names the player to the helper when it is sent a command.
+        let id: String
+        /// The app's bundle identifier.
+        let source: String?
+        let name: String
+        /// Empty when nothing is loaded.
+        let title: String
+        let artist: String
+        let album: String
+        var isPlaying: Bool
+        let progress: Progress?
+        /// Where its picture is kept, in `otherArtwork`; the system's pick
+        /// has its picture in `artwork`.
+        let artworkKey: String?
+        /// What it says it can do. Nil until the card has asked, and then
+        /// taken to be a music player's: play and pause, change track, seek.
+        var abilities: Abilities? = nil
+
+        /// The system's pick — the player the fields of the model describe.
+        var isSystem = false
+        var hasTrack: Bool { !title.isEmpty }
+
+        /// Skips by a few seconds rather than changing track — a video in a
+        /// browser does — so its buttons are −15 and +15, as in Control Center.
+        var skips: Bool { abilities.map { $0.has(17) && !$0.has(4) } ?? false }
+        var skipInterval: Double { abilities?.skipInterval ?? 15 }
+        var canGoBack: Bool { abilities.map { $0.has(skips ? 18 : 5) } ?? true }
+        var canGoForward: Bool { abilities.map { $0.has(skips ? 17 : 4) } ?? true }
+        var canPlayPause: Bool { abilities.map { $0.has(0) || $0.has(1) || $0.has(2) } ?? true }
+        var canScrub: Bool { abilities.map { $0.has(24) && $0.scrubbable } ?? true }
+    }
+
+    /// The commands a player takes, as it lists them for the system — the
+    /// list Control Center reads to choose its buttons — with the interval
+    /// it skips by, whether its bar may be dragged, and its colour.
+    struct Abilities: Equatable {
+        let commands: Set<Int>
+        let skipInterval: Double?
+        let scrubbable: Bool
+        let tint: NSColor?
+
+        func has(_ command: Int) -> Bool { commands.contains(command) }
+
+        init?(_ entry: [String: Any]) {
+            guard let commands = entry["commands"] as? [NSNumber] else { return nil }
+            self.commands = Set(commands.map(\.intValue))
+            skipInterval = (entry["skipInterval"] as? NSNumber)?.doubleValue
+            scrubbable = (entry["scrubbable"] as? Bool) ?? true
+            tint = (entry["tint"] as? [NSNumber]).flatMap { rgb in
+                rgb.count == 3 ? NSColor(srgbRed: CGFloat(rgb[0].doubleValue), green: CGFloat(rgb[1].doubleValue),
+                                         blue: CGFloat(rgb[2].doubleValue), alpha: 1) : nil
+            }
+        }
+    }
+
+    /// The player the system sends commands to. Not always the one it
+    /// reports as now playing: that one can be Safari, playing, while
+    /// commands go to Chrome, paused. Nil until the helper has said.
+    @Published private(set) var commandTargetID: String?
+
+    /// The one player the buttons can reach.
+    var controllableID: String { commandTargetID ?? systemPlayer.id }
+
+    /// The system's pick as the helper lists it, matched by app and title.
+    /// Worked out afresh each time, so that when the pick changes the list
+    /// follows at once instead of showing one player in two places.
+    private var systemEntry: Player? {
+        guard hasTrack else { return nil }
+        if let exact = listed.first(where: { $0.source == source && $0.title == title }) { return exact }
+        // Between polls the title may have moved on in one list and not the
+        // other; the app's only player is then the one.
+        let sameApp = listed.filter { $0.source == source }
+        return sameApp.count == 1 ? sameApp[0] : nil
+    }
+
+    /// The others, the system's pick taken out.
+    var others: [Player] {
+        let pick = systemEntry?.id
+        return listed.filter { $0.id != pick }
+    }
+
+    /// From the model's own fields, under the helper's name for it once it
+    /// has listed it — until then `Player.systemID`.
+    private var systemPlayer: Player {
+        let entry = systemEntry
+        return Player(id: entry?.id ?? Player.systemID, source: source, name: sourceName ?? "",
+                      title: hasTrack ? title : "", artist: artist, album: album,
+                      isPlaying: isPlaying, progress: progress, artworkKey: nil,
+                      abilities: entry?.abilities, isSystem: true)
+    }
+
+    /// The order players were first seen in. Each keeps its place: starting
+    /// one, which makes it the system's pick, does not move it to the top.
+    @Published private(set) var order: [String] = []
+
+    /// Everything that is playing or paused, each in its place. The system's
+    /// pick is left out only when it has nothing and another player has
+    /// something.
+    var players: [Player] {
+        let all = (hasTrack || others.isEmpty ? [systemPlayer] : []) + others
+        let place = Dictionary(order.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
+        // Not placed yet: the system's pick ahead of all, others at the end.
+        func rank(_ item: (offset: Int, element: Player)) -> Int {
+            place[item.element.id] ?? (item.element.isSystem ? -1 : order.count + item.offset)
+        }
+        return all.enumerated().sorted { rank($0) < rank($1) }.map(\.element)
+    }
+
+    /// When each player was last seen playing.
+    private var lastPlayed: [String: Date] = [:]
+
+    /// The player that played last: one playing now, the system's pick if it
+    /// is, else whichever was seen playing most recently.
+    var lastPlayedID: String? {
+        let seen = players.compactMap { player in lastPlayed[player.id].map { (player, $0) } }
+        guard let latest = seen.map(\.1).max() else { return nil }
+        let candidates = seen.filter { $0.1 == latest }.map(\.0)
+        return (candidates.first { $0.isSystem } ?? candidates.first)?.id
+    }
+
+    private func notePlaying() {
+        let now = Date()
+        for player in players where player.isPlaying { lastPlayed[player.id] = now }
+    }
+
+    /// Set when the card opens, until the system's pick has been put first.
+    private var putPickFirst = false
+
+    /// The system's pick — Now Playing — to the top, once, as the card
+    /// opens; after that each keeps its place while the card is open.
+    private func placePickFirst() {
+        guard putPickFirst, let id = systemEntry?.id else { return }
+        order.removeAll { $0 == id }
+        order.insert(id, at: 0)
+        putPickFirst = false
+    }
+
+    /// Whether one of the players is opened out.
+    var hasOpen: Bool { players.contains { $0.id == openID } }
+
+    /// Opens a player out and folds the one that was; or folds it, if it was
+    /// the one.
+    func toggleOpen(_ player: Player) {
+        openID = openID == player.id ? nil : player.id
+    }
+
+    /// Done each time the card opens. If a player was opened out when it
+    /// was last closed, the one opened out now is the one that played last.
+    /// If all were folded, they stay folded.
+    func openActive() {
+        guard openID != nil else { return }
+        if let id = lastPlayedID ?? players.first?.id { openID = id }
+    }
+
+    func artwork(for player: Player) -> NSImage? {
+        player.isSystem ? artwork : player.artworkKey.flatMap { otherArtwork[$0] }
+    }
 
     /// A reading of the position, not the position itself.
     ///
@@ -139,6 +310,7 @@ final class NowPlayingModel: ObservableObject {
         album = info["album"] as? String ?? ""
         source = hasTrack ? info["source"] as? String : nil
         progress = Self.progress(from: info, playbackRate: playbackRate, hasTrack: hasTrack)
+        notePlaying()
         updateArtwork(identifier: info["artworkIdentifier"] as? String)
         schedulePolling()
     }
@@ -158,14 +330,179 @@ final class NowPlayingModel: ObservableObject {
             let data = SystemArtwork.fetch()
             onMain { [weak self] in
                 guard let self, self.artworkTrack == track else { return }
-                self.artwork = data.flatMap(NSImage.init(data:))
+                // A source can stop publishing the picture partway through a
+                // track — Safari does, for some videos — and the one it gave
+                // stays. A new track has already let go of the old one.
+                if let image = data.flatMap(NSImage.init(data:)) { self.artwork = image }
+            }
+        }
+    }
+
+    // MARK: Other players
+
+    private var watchTimer: Timer?
+
+    /// While the card is open the main track and the other players are asked
+    /// after every two seconds: someone is looking at them.
+    func startWatching() {
+        putPickFirst = true
+        placePickFirst()
+        refresh()
+        refreshOthers()
+        watchTimer?.invalidate()
+        watchTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refresh()
+                self?.refreshOthers()
+            }
+        }
+    }
+
+    func stopWatching() {
+        watchTimer?.invalidate()
+        watchTimer = nil
+    }
+
+    func refreshOthers() {
+        // Pictures already in hand are not sent again.
+        let known = otherArtwork.keys.joined(separator: "\n")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let data = SystemHelper.call("NPMWritePlayers", environment: ["NPM_KNOWN_ARTWORK": known])
+            let entries = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [[String: Any]] ?? []
+            onMain { self?.applyOthers(entries) }
+        }
+    }
+
+    private func applyOthers(_ entries: [[String: Any]]) {
+        var pictures = otherArtwork
+        var players: [Player] = []
+        var targetID: String?
+        for entry in entries {
+            guard let id = entry["id"] as? String, let title = entry["title"] as? String,
+                  let key = entry["artworkKey"] as? String else { continue }
+            let rate = (entry["playbackRate"] as? NSNumber)?.doubleValue ?? 0
+            players.append(Player(
+                id: id,
+                source: entry["source"] as? String,
+                name: entry["name"] as? String ?? "",
+                title: title,
+                artist: entry["artist"] as? String ?? "",
+                album: entry["album"] as? String ?? "",
+                isPlaying: rate > 0,
+                progress: Self.progress(from: entry, playbackRate: rate, hasTrack: true),
+                artworkKey: key,
+                abilities: Abilities(entry)
+            ))
+            if entry["target"] as? Bool ?? false { targetID = id }
+            if let encoded = entry["artwork"] as? String, let data = Data(base64Encoded: encoded),
+               let image = NSImage(data: data) {
+                pictures[key] = image
+            }
+        }
+        let keys = Set(players.compactMap(\.artworkKey))
+        pictures = pictures.filter { keys.contains($0.key) }
+        if pictures.keys != otherArtwork.keys { otherArtwork = pictures }
+        if players != listed { listed = players }
+        // The opened one stays opened once it has its real name.
+        if openID == Player.systemID, let entry = systemEntry { openID = entry.id }
+        if targetID != commandTargetID { commandTargetID = targetID }
+        updateOrder(with: players.map(\.id))
+        placePickFirst()
+        notePlaying()
+    }
+
+    /// Players new to the list go at the end; ones gone are forgotten.
+    private func updateOrder(with present: [String]) {
+        var updated = order.filter(present.contains)
+        for id in present where !updated.contains(id) { updated.append(id) }
+        if updated != order { order = updated }
+    }
+
+    // The system's pick is sent its commands the way it always was; the
+    // others through the helper, by name.
+
+    /// The player the system sends commands to is told directly. Any other
+    /// cannot be reached that way, so its button is pressed in Control
+    /// Center, which can.
+    func togglePlayPause(_ player: Player) {
+        guard player.id != controllableID else { return togglePlayPause() }
+        // Shown at once; the next poll says whether it took.
+        if let index = listed.firstIndex(where: { $0.id == player.id }) { listed[index].isPlaying.toggle() }
+        ControlCenterRemote.press(.playPause, on: player.title) { [weak self] _ in
+            self?.refresh()
+            self?.refreshOthers()
+        }
+    }
+
+    /// Next track, or a skip forward for a player that skips.
+    func goForward(_ player: Player) {
+        guard player.id == controllableID else {
+            return ControlCenterRemote.press(.forward, on: player.title) { [weak self] _ in
+                self?.refresh()
+                self?.refreshOthers()
+            }
+        }
+        if player.skips {
+            _ = MRBSkip(true, player.skipInterval)
+            refreshSoon()
+        } else {
+            nextTrack()
+        }
+    }
+
+    /// Previous track, or a skip back for a player that skips.
+    func goBack(_ player: Player) {
+        guard player.id == controllableID else { return send(player.skips ? 18 : 5, to: player) }
+        if player.skips {
+            _ = MRBSkip(false, player.skipInterval)
+            refreshSoon()
+        } else {
+            previousTrack()
+        }
+    }
+
+    func seek(_ player: Player, to seconds: Double) {
+        player.id == controllableID ? seek(to: seconds) : send(24, to: player, position: max(seconds, 0))
+    }
+
+    private func send(_ command: Int, to player: Player, position: Double? = nil) {
+        var environment = ["NPM_PLAYER": player.id, "NPM_COMMAND": String(command)]
+        if let position { environment["NPM_POSITION"] = String(position) }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = SystemHelper.call("NPMSendPlayerCommand", environment: environment)
+            onMain {
+                self?.refresh()
+                self?.refreshOthers()
             }
         }
     }
 
     // MARK: Commands
+    //
+    // All of them go through the system, as Control Center's do. The system
+    // hands a command from an app like this one to the player it has
+    // elected; a player that publishes what it plays but takes no commands
+    // (VLC 3 is one) does not answer them here, nor in Control Center.
 
+    /// Plays or pauses the player the system sends commands to. The helper
+    /// asks the system whether that one is playing and sends Pause or Play
+    /// outright, as Control Center does: some players — Safari among them —
+    /// take no Toggle, and the player this app shows first is not always the
+    /// one the command reaches, so its own state would be the wrong guide.
     func togglePlayPause() {
+        guard SystemHelper.available else { return toggleDirectly() }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            _ = SystemHelper.call("NPMTogglePlayPause")
+            onMain {
+                guard let self else { return }
+                self.refreshSoon()
+                if self.watchTimer != nil { onMain(after: 0.4) { self.refreshOthers() } }
+            }
+        }
+    }
+
+    /// Without the helper: the system's Toggle, or the media key.
+    private func toggleDirectly() {
         if !MRBTogglePlayPause() {
             // Fallback for systems that don't expose the direct command symbol.
             postMediaKey(16)
@@ -183,10 +520,14 @@ final class NowPlayingModel: ObservableObject {
         refreshSoon()
     }
 
-    /// Brings the playing app forward — the way clicking the artwork in
+    static func icon(of source: String) -> NSImage? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: source)
+            .map { NSWorkspace.shared.icon(forFile: $0.path) }
+    }
+
+    /// Brings a playing app forward — the way clicking the artwork in
     /// Control Center does.
-    func openSource() {
-        guard let source else { return }
+    static func open(_ source: String) {
         if let running = NSRunningApplication.runningApplications(withBundleIdentifier: source).first {
             running.activate(options: [.activateAllWindows])
         } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: source) {
@@ -260,9 +601,6 @@ final class DisplaySettings: ObservableObject {
     @Published var scrollDirection: Int { didSet { save("scrollDirection", scrollDirection) } }
     @Published var scrollSpeed: Double { didSet { save("scrollSpeed", scrollSpeed) } }
     @Published var pageInterval: Double { didSet { save("pageInterval", pageInterval) } }
-    /// Whether the card in the menu is folded to one row. Not a setting in
-    /// the window: it is toggled by clicking the title, and remembered.
-    @Published var compactCard: Bool { didSet { save("compactCard", compactCard) } }
     /// Which click does what on the status item. Off: a click plays or
     /// pauses and a secondary (two-finger) click opens the card. On: the
     /// other way round.
@@ -283,7 +621,6 @@ final class DisplaySettings: ObservableObject {
         scrollDirection = defaults.object(forKey: "scrollDirection") as? Int ?? 0
         scrollSpeed = defaults.object(forKey: "scrollSpeed") as? Double ?? 3
         pageInterval = defaults.object(forKey: "pageInterval") as? Double ?? 2
-        compactCard = defaults.object(forKey: "compactCard") as? Bool ?? false
         clickOpensCard = defaults.object(forKey: "clickOpensCard") as? Bool ?? false
     }
 
@@ -340,7 +677,19 @@ final class DisplaySettings: ObservableObject {
 }
 
 private enum SystemNowPlaying {
+    /// From the helper, which can tell a paused player from a playing one
+    /// by its playback state; the script can read only the rate the player
+    /// left in its info, and VLC leaves 1 there when paused. The script is
+    /// kept for when the helper is not to be found.
     static func fetch() -> [String: Any] {
+        if SystemHelper.available {
+            let data = SystemHelper.call("NPMWriteNowPlaying")
+            return data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any] ?? [:]
+        }
+        return fetchByScript()
+    }
+
+    private static func fetchByScript() -> [String: Any] {
         guard let scriptURL = Bundle.module.url(forResource: "now-playing", withExtension: "js") else { return [:] }
 
         let process = Process()
@@ -388,11 +737,217 @@ private enum SystemNowPlaying {
     }
 }
 
-/// The artwork of the current item. The app may not ask mediaremoted for it
-/// (see ArtworkHelper.m), so the system's own perl asks instead, loading the
-/// helper library and calling into it.
-private enum SystemArtwork {
-    static func fetch() -> Data? {
+/// Set while Control Center is being worked out of sight: any window it
+/// makes then is moved off the screen the moment it exists.
+private var controlCenterOffstage = false
+
+private let moveNewWindowAway: AXObserverCallback = { _, element, _, _ in
+    guard controlCenterOffstage else { return }
+    var point = CGPoint(x: -10_000, y: -10_000)
+    if let value = AXValueCreate(.cgPoint, &point) {
+        AXUIElementSetAttributeValue(element, kAXPositionAttribute as CFString, value)
+    }
+}
+
+/// Presses a player's button in Control Center's Now Playing.
+///
+/// The system sends commands from an app like this one only to the one
+/// player it has chosen; Control Center, being Apple's, can reach each of
+/// them. So for any other player this opens Control Center, opens its Now
+/// Playing out to the list of players, presses the button in that player's
+/// row, and closes it again — all through the accessibility interface, which
+/// the user allows once in Privacy & Security.
+///
+/// Control Center is kept out of sight while it does: its window is moved
+/// off the screen the moment the system announces it, before it has much
+/// more than begun to draw, and everything is pressed there. (Hiding
+/// Control Center first, as an app is with Command-H, would hide it better,
+/// but then it opens no window at all.)
+///
+/// The layout it relies on, as macOS 27 draws it: the Control Center item is
+/// in MenuBarAgent's windows; Control Center's window holds a group with a
+/// play or pause button, whose "show details" action lists every player as
+/// a group of a text — "title, artist" — and buttons named by their symbols.
+@MainActor
+enum ControlCenterRemote {
+    enum Button {
+        case playPause, forward
+
+        func matches(_ identifier: String, _ description: String) -> Bool {
+            switch self {
+            case .playPause:
+                return ["play.fill", "pause.fill"].contains(identifier) || ["play", "pause"].contains(description)
+            case .forward:
+                return identifier == "forward.fill" || identifier.contains("arrow.trianglehead.clockwise")
+                    || description.hasPrefix("next") || description.hasPrefix("fast-forward")
+            }
+        }
+    }
+
+    private static var busy = false
+
+    static func press(_ button: Button, on title: String, done: @escaping (Bool) -> Void) {
+        let prompt = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+        guard !busy, !title.isEmpty, AXIsProcessTrustedWithOptions(prompt),
+              let controlCenter = app("com.apple.controlcenter"),
+              let menuBar = app("com.apple.MenuBarAgent"),
+              let item = children(menuBar, kAXWindowsAttribute).lazy
+                .compactMap({ find($0, identifier: "com.apple.menuextra.controlcenter") }).first
+        else { return done(false) }
+        busy = true
+
+        let wasOpen = !children(controlCenter, kAXWindowsAttribute).isEmpty
+        if !wasOpen {
+            watchForWindows(of: controlCenter)
+            controlCenterOffstage = true
+            AXUIElementPerformAction(item, kAXPressAction as CFString)
+        }
+        func finish(_ pressed: Bool) {
+            // Closed again only if it was opened here; the next time the
+            // user opens it, it is left where it belongs.
+            onMain(after: 0.15) {
+                if !wasOpen { AXUIElementPerformAction(item, kAXPressAction as CFString) }
+                onMain(after: 0.3) {
+                    if !wasOpen { controlCenterOffstage = false }
+                    // The card gets the keyboard back from Control Center.
+                    NSApp.windows.first { $0 is CardPanel && $0.isVisible }?.makeKey()
+                    busy = false
+                    onMain(after: 0.1) { done(pressed) }
+                }
+            }
+        }
+
+        // Each step waits for what it needs to appear, a little at a time;
+        // the first watches closely, to catch the window before it is drawn.
+        waitFor({ children(controlCenter, kAXWindowsAttribute).first }, every: 0.003, tries: 300) { window in
+            guard let window else { return finish(false) }
+            if !wasOpen { moveAway(window) }
+            waitFor({ nowPlayingModule(in: controlCenter) }) { module in
+            guard let module else { return finish(false) }
+            if let details = actionNames(module).first(where: { $0.contains("show details") }) {
+                AXUIElementPerformAction(module, details as CFString)
+            }
+            // Opening the list out may set the window back in place.
+            if !wasOpen { moveAway(window) }
+            waitFor({ row(for: title, in: controlCenter) }) { row in
+                guard let row,
+                      let target = children(row).first(where: {
+                          button.matches(string($0, kAXIdentifierAttribute), string($0, kAXDescriptionAttribute))
+                      })
+                else { return finish(false) }
+                AXUIElementPerformAction(target, kAXPressAction as CFString)
+                finish(true)
+            }
+            }
+        }
+    }
+
+    private static var observer: AXObserver?
+    private static var observedProcess: pid_t = 0
+
+    /// Asks to be told the instant Control Center makes a window. Set up
+    /// once, and again if Control Center has been restarted.
+    private static func watchForWindows(of controlCenter: AXUIElement) {
+        var pid: pid_t = 0
+        AXUIElementGetPid(controlCenter, &pid)
+        guard pid != observedProcess else { return }
+        if let observer {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        var created: AXObserver?
+        guard AXObserverCreate(pid, moveNewWindowAway, &created) == .success, let created else { return }
+        AXObserverAddNotification(created, controlCenter, kAXWindowCreatedNotification as CFString, nil)
+        CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(created), .commonModes)
+        observer = created
+        observedProcess = pid
+    }
+
+    private static func moveAway(_ window: AXUIElement) {
+        var point = CGPoint(x: -10_000, y: -10_000)
+        guard let value = AXValueCreate(.cgPoint, &point) else { return }
+        AXUIElementSetAttributeValue(window, kAXPositionAttribute as CFString, value)
+    }
+
+    // MARK: Finding things
+
+    /// The group holding a play or pause button. Found by its button, not
+    /// its picture: a player without one shows none.
+    private static func nowPlayingModule(in controlCenter: AXUIElement) -> AXUIElement? {
+        children(controlCenter, kAXWindowsAttribute).lazy.compactMap {
+            group(in: $0, holdingIdentifier: ["play.fill", "pause.fill"])
+        }.first
+    }
+
+    /// The row whose text begins with the title, once the list is out.
+    private static func row(for title: String, in controlCenter: AXUIElement) -> AXUIElement? {
+        let wanted = title.lowercased()
+        for window in children(controlCenter, kAXWindowsAttribute) {
+            for host in children(window) {
+                for row in children(host) where actionNames(row).contains(where: { $0.contains("hide details") }) {
+                    let text = children(row).first { string($0, kAXRoleAttribute) == kAXStaticTextRole }
+                    if let text, string(text, kAXValueAttribute).lowercased().hasPrefix(wanted) { return row }
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func waitFor(_ look: @escaping () -> AXUIElement?, every interval: TimeInterval = 0.05,
+                                tries: Int = 30, then: @escaping (AXUIElement?) -> Void) {
+        if let found = look() { return then(found) }
+        guard tries > 0 else { return then(nil) }
+        onMain(after: interval) { waitFor(look, every: interval, tries: tries - 1, then: then) }
+    }
+
+    private static func group(in node: AXUIElement, holdingIdentifier identifiers: Set<String>,
+                              depth: Int = 0) -> AXUIElement? {
+        guard depth < 6 else { return nil }
+        for child in children(node) {
+            if identifiers.contains(string(child, kAXIdentifierAttribute)) { return node }
+            if let hit = group(in: child, holdingIdentifier: identifiers, depth: depth + 1) { return hit }
+        }
+        return nil
+    }
+
+    private static func find(_ node: AXUIElement, identifier: String, depth: Int = 0) -> AXUIElement? {
+        guard depth < 6 else { return nil }
+        if string(node, kAXIdentifierAttribute) == identifier { return node }
+        for child in children(node) {
+            if let hit = find(child, identifier: identifier, depth: depth + 1) { return hit }
+        }
+        return nil
+    }
+
+    private static func app(_ bundleID: String) -> AXUIElement? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first
+            .map { AXUIElementCreateApplication($0.processIdentifier) }
+    }
+
+    private static func children(_ node: AXUIElement, _ attribute: String = kAXChildrenAttribute) -> [AXUIElement] {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(node, attribute as CFString, &value) == .success else { return [] }
+        return (value as? [AXUIElement]) ?? []
+    }
+
+    private static func string(_ node: AXUIElement, _ attribute: String) -> String {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(node, attribute as CFString, &value) == .success else { return "" }
+        return value as? String ?? ""
+    }
+
+    private static func actionNames(_ node: AXUIElement) -> [String] {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(node, &names) == .success else { return [] }
+        return names as? [String] ?? []
+    }
+}
+
+/// Calls a function of the helper library and returns what it wrote. The
+/// app may not ask mediaremoted for these things itself (see
+/// ArtworkHelper.m), so the system's own perl asks instead, loading the
+/// helper library and calling into it; arguments go in the environment.
+private enum SystemHelper {
+    static func call(_ function: String, environment: [String: String] = [:]) -> Data? {
         guard let library = helperURL() else { return nil }
         let process = Process()
         let output = Pipe()
@@ -400,10 +955,11 @@ private enum SystemArtwork {
         process.arguments = ["-e", """
             use DynaLoader;
             my $h = DynaLoader::dl_load_file($ARGV[0]) or die DynaLoader::dl_error();
-            my $f = DynaLoader::dl_find_symbol($h, "NPMWriteArtwork") or die "no symbol";
-            DynaLoader::dl_install_xsub("main::artwork", $f);
-            artwork();
-            """, library.path]
+            my $f = DynaLoader::dl_find_symbol($h, $ARGV[1]) or die "no symbol";
+            DynaLoader::dl_install_xsub("main::call", $f);
+            call();
+            """, library.path, function]
+        process.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
         do {
@@ -416,6 +972,8 @@ private enum SystemArtwork {
         }
     }
 
+    static var available: Bool { helperURL() != nil }
+
     /// In the app it is in Contents/Frameworks; under `swift run` it is
     /// beside the executable.
     private static func helperURL() -> URL? {
@@ -426,6 +984,11 @@ private enum SystemArtwork {
         ]
         return places.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
     }
+}
+
+/// The artwork of the current item.
+private enum SystemArtwork {
+    static func fetch() -> Data? { SystemHelper.call("NPMWriteArtwork") }
 }
 
 @MainActor
@@ -585,7 +1148,7 @@ private final class MarqueeStatusItem: NSObject {
     )
     private var settingsWindow: NSWindow?
     private var card: NSPanel?
-    private var cardHost: NSHostingView<NowPlayingCard>?
+    private var cardHost: CardHostingView<NowPlayingCard>?
     private var cardMonitors: [Any] = []
     private var cardResize: Timer?
 
@@ -948,35 +1511,43 @@ private final class MarqueeStatusItem: NSObject {
         if card != nil { closeCard(); return }
         guard let button = statusItem.button, let barWindow = button.window else { return }
 
-        let host = NSHostingView(rootView: NowPlayingCard(
-            player: player, settings: settings,
+        player.openActive()
+        let host = CardHostingView(rootView: NowPlayingCard(
+            player: player,
             openSettings: { [weak self] in self?.closeCard(); self?.showSettings() },
-            openSource: { [weak self] in self?.closeCard(); self?.player.openSource() },
+            openSource: { [weak self] source in self?.closeCard(); NowPlayingModel.open(source) },
             resized: { [weak self] in onMain { self?.fitCard() } }
         ))
         // The card says nothing about its size to the window: the window is
         // sized from outside, in step with the card, and the card fills it.
         host.sizingOptions = []
         let size = NSSize(width: NowPlayingCard.width,
-                          height: NowPlayingCard.height(compact: settings.compactCard))
+                          height: NowPlayingCard.height(players: player.players.count,
+                                                        anyOpen: player.hasOpen))
 
-        let backdrop = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
-        backdrop.material = .popover
-        backdrop.blendingMode = .behindWindow
-        backdrop.state = .active
-        // The mask shapes the blur, which the window server draws and a
-        // layer's corners do not reach; the layer carries the hairline edge.
-        backdrop.maskImage = Self.roundedMask(radius: Self.cardRadius)
-        backdrop.wantsLayer = true
-        backdrop.layer?.cornerRadius = Self.cardRadius
-        backdrop.layer?.masksToBounds = true
-        backdrop.layer?.borderWidth = 0.5
-        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        backdrop.layer?.borderColor = (dark ? NSColor.white.withAlphaComponent(0.16)
-                                            : NSColor.black.withAlphaComponent(0.1)).cgColor
-        host.frame = backdrop.bounds
+        // See-through, like a menu. The glass the system's own menus and
+        // Control Center are made of, rounded by itself; before macOS 26, the
+        // menu blur, shaped by a mask alone. Corners and a border put on the
+        // blur's layer instead had the system draw it as a flat fill.
+        let frame = NSRect(origin: .zero, size: size)
+        host.frame = frame
         host.autoresizingMask = [.width, .height]
-        backdrop.addSubview(host)
+        let backdrop: NSView
+        if #available(macOS 26, *) {
+            let glass = NSGlassEffectView(frame: frame)
+            glass.style = .regular
+            glass.cornerRadius = Self.cardRadius
+            glass.contentView = host
+            backdrop = glass
+        } else {
+            let blur = NSVisualEffectView(frame: frame)
+            blur.material = .menu
+            blur.blendingMode = .behindWindow
+            blur.state = .active
+            blur.maskImage = Self.roundedMask(radius: Self.cardRadius)
+            blur.addSubview(host)
+            backdrop = blur
+        }
 
         let panel = CardPanel(contentRect: NSRect(origin: .zero, size: size),
                               styleMask: [.borderless, .nonactivatingPanel],
@@ -987,7 +1558,18 @@ private final class MarqueeStatusItem: NSObject {
         panel.level = .popUpMenu
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         panel.isReleasedWhenClosed = false
-        panel.contentView = backdrop
+        // Everything outside the rounded corners is cut away, so the window
+        // has nothing there for its shadow to follow. Left square, it threw a
+        // square shadow whose dark edge showed past the glass at the corners.
+        let clip = NSView(frame: frame)
+        clip.wantsLayer = true
+        clip.layer?.cornerRadius = Self.cardRadius
+        clip.layer?.cornerCurve = .continuous
+        clip.layer?.masksToBounds = true
+        backdrop.frame = clip.bounds
+        backdrop.autoresizingMask = [.width, .height]
+        clip.addSubview(backdrop)
+        panel.contentView = clip
         panel.onCancel = { [weak self] in self?.closeCard() }
 
         // Under the left edge of the status item, a little below the bar,
@@ -1001,10 +1583,11 @@ private final class MarqueeStatusItem: NSObject {
 
         card = panel
         cardHost = host
-        player.refresh()
+        player.startWatching()
 
         panel.alphaValue = 0
         panel.makeKeyAndOrderFront(nil)
+        panel.invalidateShadow()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.15
             panel.animator().alphaValue = 1
@@ -1028,6 +1611,7 @@ private final class MarqueeStatusItem: NSObject {
     }
 
     private func closeCard() {
+        player.stopWatching()
         cardResize?.invalidate()
         cardResize = nil
         cardMonitors.forEach(NSEvent.removeMonitor)
@@ -1043,14 +1627,15 @@ private final class MarqueeStatusItem: NSObject {
         })
     }
 
-    /// Folding the card changes its height. The card animates its pieces
+    /// Opening a player out or folding it changes the card's height, and so
+    /// does a player coming or going. The card animates its pieces
     /// itself; the window is walked to the new height frame by frame on the
     /// same curve and over the same time, with its top edge held still.
     private func fitCard() {
         guard let panel = card else { return }
         cardResize?.invalidate()
         let from = panel.frame.height
-        let target = NowPlayingCard.height(compact: settings.compactCard)
+        let target = NowPlayingCard.height(players: player.players.count, anyOpen: player.hasOpen)
         guard abs(target - from) > 0.5 else { return }
         let top = panel.frame.maxY
         let start = CACurrentMediaTime()
@@ -1154,86 +1739,143 @@ private final class MarqueeStatusItem: NSObject {
 /// the transport, and a bar that can be dragged to move through the track.
 private struct NowPlayingCard: View {
     @ObservedObject var player: NowPlayingModel
-    @ObservedObject var settings: DisplaySettings
     let openSettings: () -> Void
-    let openSource: () -> Void
+    /// Closes the card and brings the app with this bundle identifier forward.
+    let openSource: (String) -> Void
     let resized: () -> Void
 
-    private static let artworkSide: CGFloat = 100
-    private static let compactArtworkSide: CGFloat = 44
-    private static let padding = EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+    static let artworkSide: CGFloat = 100
+    static let compactArtworkSide: CGFloat = 44
+    static let padding = EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
 
     static let width: CGFloat = 296
-    /// The card's height either way. Known in advance rather than measured,
-    /// so the window can set off for it at the same moment as the card.
-    static func height(compact: Bool) -> CGFloat {
-        (compact ? compactArtworkSide : artworkSide) + padding.top + padding.bottom
+    static let foldedHeight = compactArtworkSide + padding.top + padding.bottom
+    static let openHeight = artworkSide + padding.top + padding.bottom
+    /// A folded row for every player, one of them perhaps opened out. Known
+    /// in advance rather than measured, so the window can set off for it at
+    /// the same moment as the card.
+    static func height(players: Int, anyOpen: Bool) -> CGFloat {
+        CGFloat(max(players, 1)) * foldedHeight + (anyOpen ? openHeight - foldedHeight : 0)
     }
     /// How long folding takes. The card and its window both use it, on the
     /// same curve (`.easeInOut`, see `easeInOut(_:)`), so they move as one.
     static let foldDuration: TimeInterval = 0.45
     static var fold: Animation { .easeInOut(duration: foldDuration) }
 
-    /// One layout for both shapes, every piece always there, so folding
-    /// moves each one from where it was to where it goes and nothing fades.
-    /// The cover shrinks into its corner, the title slides down beside it,
-    /// play and skip travel to the end of the row, and the window's bottom
-    /// edge, coming up, pushes the bar out of the card. The gear and the
-    /// back button do not travel: they shrink away as folding starts, and
-    /// pop back in near its end. Opening runs it all backwards.
-    ///
-    /// Places are worked out here rather than left to stacks, because a
-    /// piece that changes stacks is a new piece to SwiftUI and can only be
-    /// faded from one to the other.
-    private var compact: Bool { settings.compactCard }
+    /// Every player, the system's pick first, each folded to one row when the
+    /// card opens. Clicking a title opens that player out and folds the one
+    /// that was open.
+    var body: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(player.players.enumerated()), id: \.element.id) { index, item in
+                PlayerBlock(model: player, item: item, open: item.id == player.openID,
+                            first: index == 0, openSettings: openSettings, openSource: openSource)
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+        .onChange(of: player.players.count) { _ in resized() }
+        .onChange(of: player.hasOpen) { _ in resized() }
+    }
+}
+
+/// One player in the card, folded to a row or opened out.
+///
+/// One layout for both shapes, every piece always there, so folding moves
+/// each one from where it was to where it goes and nothing fades. The cover
+/// shrinks into its corner, the title slides down beside it, play and skip
+/// travel to the end of the row, and the bottom edge, coming up, pushes the
+/// bar out. The gear and the back button do not travel: they shrink away as
+/// folding starts, and pop back in near its end. Opening runs it all
+/// backwards.
+///
+/// Places are worked out here rather than left to stacks, because a piece
+/// that changes stacks is a new piece to SwiftUI and can only be faded from
+/// one to the other.
+private struct PlayerBlock: View {
+    @ObservedObject var model: NowPlayingModel
+    let item: NowPlayingModel.Player
+    let open: Bool
+    /// The first has no hairline over it.
+    let first: Bool
+    let openSettings: () -> Void
+    let openSource: (String) -> Void
+
+    private var compact: Bool { !open }
+
+    /// Whether this is the player the system sends commands to, and so the
+    /// one the back button and the bar can reach. Play and forward reach the
+    /// others too, through Control Center.
+    private var controllable: Bool { item.id == model.controllableID }
 
     var body: some View {
         let layout = Layout(compact: compact)
         ZStack(alignment: .topLeading) {
             artwork(side: layout.side)
-                .overlay(alignment: .topLeading) {
-                    SettingsBadge(action: openSettings)
-                        .modifier(PopsIn(shown: !compact))
-                        .padding(5)
-                }
             VStack(alignment: .leading, spacing: 1) {
-                MarqueeText(text: player.hasTrack ? player.title : "Not Playing",
-                            font: .systemFont(ofSize: 14, weight: .semibold))
+                HStack(spacing: 6) {
+                    // Only the one playing runs its title along.
+                    MarqueeText(text: item.hasTrack ? item.title : "Not Playing",
+                                font: .systemFont(ofSize: 14, weight: .semibold),
+                                moves: item.isPlaying)
+                    if item.hasTrack { PlayingIndicator(playing: item.isPlaying) }
+                }
                 subtitleText
             }
             .frame(width: layout.textWidth, alignment: .leading)
-            .modifier(Folds(settings: settings))
+            .modifier(Folds { model.toggleOpen(item) })
             .offset(x: layout.textX, y: layout.textY)
-            ScrubBar(player: player)
+            ScrubBar(progress: item.progress, tint: item.abilities?.tint) { model.seek(item, to: $0) }
+                .disabled(!controllable || !item.canScrub)
                 .frame(width: layout.scrubWidth)
                 .offset(x: layout.textX, y: layout.scrubY)
             Group {
-                TransportButton(symbol: "backward.fill", size: 17, width: layout.button) {
-                    player.previousTrack()
+                // What the buttons are, and which of them work, is what the
+                // player says it can do, as in Control Center.
+                TransportButton(symbol: item.skips ? Self.skipSymbol(forward: false, item.skipInterval)
+                                                   : "backward.fill",
+                                size: 17, width: layout.button) {
+                    model.goBack(item)
                 }
-                .modifier(PopsIn(shown: !compact, pulses: false))
+                // Back and the bar reach only the player commands go to;
+                // Control Center lists no such button for the others.
+                .disabled(!controllable || !item.canGoBack)
+                .modifier(PopsIn(shown: open, pulses: false))
                 .offset(x: layout.previousX, y: layout.buttonY)
-                TransportButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: 24,
-                                width: layout.button, scale: compact ? 20.0 / 24 : 1) {
-                    player.togglePlayPause()
+                TransportButton(symbol: item.isPlaying ? "pause.fill" : "play.fill", size: 24,
+                                width: layout.button, scale: compact ? 20.0 / 24 : 1,
+                                playing: item.isPlaying) {
+                    model.togglePlayPause(item)
                 }
+                .disabled(!item.canPlayPause)
                 .offset(x: layout.playX, y: layout.buttonY)
-                TransportButton(symbol: "forward.fill", size: 17,
-                                width: layout.button, scale: compact ? 15.0 / 17 : 1) {
-                    player.nextTrack()
+                TransportButton(symbol: item.skips ? Self.skipSymbol(forward: true, item.skipInterval)
+                                                   : "forward.fill",
+                                size: 17, width: layout.button, scale: compact ? 15.0 / 17 : 1) {
+                    model.goForward(item)
                 }
+                .disabled(!item.canGoForward)
                 .offset(x: layout.playX + layout.button, y: layout.buttonY)
             }
-            .disabled(!player.hasTrack)
+            .disabled(!item.hasTrack)
         }
         .frame(width: Layout.width, height: layout.side, alignment: .topLeading)
-        .padding(Self.padding)
-        // Held to the top of the window, which keeps its top edge under the
-        // menu bar and moves its bottom one. What lies past the window's
-        // edges is cut off by it.
-        .frame(width: Self.width, height: Self.height(compact: compact), alignment: .top)
-        .frame(maxHeight: .infinity, alignment: .top)
-        .onChange(of: settings.compactCard) { _ in resized() }
+        .padding(NowPlayingCard.padding)
+        // What lies past its edges — the bar and the back button, folded —
+        // is cut off here, not left to show over the player below.
+        .frame(width: NowPlayingCard.width,
+               height: open ? NowPlayingCard.openHeight : NowPlayingCard.foldedHeight,
+               alignment: .top)
+        .clipped()
+        // A hairline between it and the player above, inset like the
+        // contents.
+        .overlay(alignment: .top) {
+            if !first {
+                Rectangle()
+                    .fill(Color.primary.opacity(0.1))
+                    .frame(height: 0.5)
+                    .padding(.horizontal, NowPlayingCard.padding.leading)
+            }
+        }
     }
 
     /// The places, inside the padding, measured from its top-left corner.
@@ -1270,11 +1912,45 @@ private struct NowPlayingCard: View {
         var scrubWidth: CGFloat { Self.width - textX }
     }
 
+    /// The arrow with the interval in it — "gobackward.15" — when there is
+    /// such a symbol, a plain arrow when there is not.
+    private static func skipSymbol(forward: Bool, _ seconds: Double) -> String {
+        let name = forward ? "goforward" : "gobackward"
+        let whole = Int(seconds.rounded())
+        return [5, 10, 15, 30, 45, 60, 75, 90].contains(whole) ? "\(name).\(whole)" : name
+    }
+
     private func artwork(side: CGFloat) -> some View {
-        ArtworkTile(image: player.artwork, side: side)
+        let picture = model.artwork(for: item)
+        let icon = item.source.flatMap(NowPlayingModel.icon(of:))
+        // A video's picture is wide, and opened out it is shown whole, the
+        // way Control Center shows it: as wide as the square was, less tall,
+        // and centred on it. Folded, every picture fills a square.
+        let shape = picture.map { $0.size.height / max($0.size.width, 1) } ?? 1
+        let height = open && shape < 0.85 ? side * shape : side
+        return ArtworkTile(image: picture, side: side, height: height, placeholder: icon)
+            .overlay(alignment: .topLeading) {
+                SettingsBadge(action: openSettings)
+                    .modifier(PopsIn(shown: open))
+                    .padding(5)
+            }
+            // The app it plays in, on the cover's corner, as Control Center
+            // marks it. Not over the empty tile, which shows the icon already.
+            .overlay(alignment: .bottomTrailing) {
+                if picture != nil, let icon {
+                    Image(nsImage: icon)
+                        .resizable()
+                        .interpolation(.high)
+                        .frame(width: side * 0.22 + 8, height: side * 0.22 + 8)
+                        .shadow(color: .black.opacity(0.3), radius: 1.5, y: 0.5)
+                        .offset(x: 4, y: 4)
+                        .allowsHitTesting(false)
+                }
+            }
             .contentShape(Rectangle())
-            .onTapGesture { if player.source != nil { openSource() } }
-            .help(player.sourceName.map { "Open \($0)" } ?? "")
+            .onTapGesture { item.source.map(openSource) }
+            .help(item.name.isEmpty ? "" : "Open \(item.name)")
+            .frame(width: side, height: side)
     }
 
     private var subtitleText: some View {
@@ -1286,11 +1962,10 @@ private struct NowPlayingCard: View {
     }
 
     private var subtitle: String {
-        guard player.hasTrack else { return " " }
-        let parts = [player.artist, player.album].filter { !$0.isEmpty }
-        return parts.isEmpty ? " " : parts.joined(separator: " — ")
+        guard item.hasTrack else { return " " }
+        let parts = [item.artist, item.album].filter { !$0.isEmpty }
+        return parts.isEmpty ? (item.name.isEmpty ? " " : item.name) : parts.joined(separator: " — ")
     }
-
 }
 
 /// The ease-in-out curve of SwiftUI's `.easeInOut` and Core Animation's
@@ -1310,6 +1985,13 @@ private func easeInOut(_ x: Double) -> Double {
         t = min(max(t - error / slope, 0), 1)
     }
     return curve(t, 0, 1)
+}
+
+/// Takes the first click as a click. After Control Center has been worked
+/// the card is no longer the key window, and without this the click meant
+/// for a button only made it key again — every other press did nothing.
+private final class CardHostingView<Content: View>: NSHostingView<Content> {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
 /// The card's window. Borderless, so it says for itself that it may take
@@ -1384,6 +2066,11 @@ private struct PopsIn: ViewModifier {
 private struct ArtworkTile: View {
     let image: NSImage?
     let side: CGFloat
+    /// Less than `side` for a wide picture shown whole.
+    var height: CGFloat? = nil
+    /// The playing app's icon, drawn small in the middle of the tile while
+    /// there is no picture.
+    var placeholder: NSImage? = nil
 
     var body: some View {
         ZStack {
@@ -1394,12 +2081,16 @@ private struct ArtworkTile: View {
                     .aspectRatio(contentMode: .fill)
             } else {
                 Color.primary.opacity(0.08)
-                Image(systemName: "music.note")
-                    .font(.system(size: side * 0.34, weight: .regular))
-                    .foregroundStyle(.tertiary)
+                if let placeholder {
+                    Image(nsImage: placeholder)
+                        .resizable()
+                        .interpolation(.high)
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: min(side, height ?? side) * 0.4, height: min(side, height ?? side) * 0.4)
+                }
             }
         }
-        .frame(width: side, height: side)
+        .frame(width: side, height: height ?? side)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -1409,14 +2100,125 @@ private struct ArtworkTile: View {
     }
 }
 
-/// Clicking the title folds the card to one row, or opens it out again.
+/// Beside the title: bars that rise and fall while the player plays, and
+/// stand still as dots while it is paused.
+///
+/// Core Animation moves them, in the window server, rather than SwiftUI
+/// redrawing them every frame in this process: drawn by SwiftUI, they and
+/// the scrolling titles kept the app near a third of a core busy for as long
+/// as the card was open.
+private struct PlayingIndicator: NSViewRepresentable {
+    let playing: Bool
+
+    func makeNSView(context: Context) -> BarsView { BarsView() }
+
+    func updateNSView(_ view: BarsView, context: Context) { view.playing = playing }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: BarsView, context: Context) -> CGSize? {
+        nsView.intrinsicContentSize
+    }
+}
+
+private final class BarsView: NSView {
+    private static let bars = 4
+    private static let barWidth: CGFloat = 2
+    private static let spacing: CGFloat = 1.5
+    private static let height: CGFloat = 11
+    /// Each bar on its own pace, so together they never move in step.
+    private static let periods: [CFTimeInterval] = [0.62, 0.43, 0.75, 0.5]
+
+    var playing = false {
+        didSet { if playing != oldValue { animate() } }
+    }
+
+    private var barLayers: [CALayer] = []
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        for _ in 0..<Self.bars {
+            let bar = CALayer()
+            bar.anchorPoint = CGPoint(x: 0.5, y: 0)
+            bar.cornerRadius = Self.barWidth / 2
+            layer?.addSublayer(bar)
+            barLayers.append(bar)
+        }
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        animate()
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: CGFloat(Self.bars) * Self.barWidth + CGFloat(Self.bars - 1) * Self.spacing,
+               height: Self.height)
+    }
+
+    override var wantsUpdateLayer: Bool { true }
+
+    override func updateLayer() {
+        let colour = NSColor.secondaryLabelColor.cgColor
+        for bar in barLayers { bar.backgroundColor = colour }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (index, bar) in barLayers.enumerated() {
+            let x = CGFloat(index) * (Self.barWidth + Self.spacing) + Self.barWidth / 2
+            bar.position = CGPoint(x: x, y: 0)
+            bar.bounds.size.width = Self.barWidth
+        }
+        CATransaction.commit()
+    }
+
+    private func animate() {
+        for (index, bar) in barLayers.enumerated() {
+            let resting = Self.barWidth
+            let from = bar.presentation()?.bounds.size.height ?? resting
+            bar.removeAllAnimations()
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            bar.bounds.size.height = resting
+            CATransaction.commit()
+            if playing {
+                let bounce = CABasicAnimation(keyPath: "bounds.size.height")
+                bounce.fromValue = resting
+                bounce.toValue = Self.height
+                bounce.duration = Self.periods[index % Self.periods.count]
+                bounce.autoreverses = true
+                bounce.repeatCount = .infinity
+                bounce.timeOffset = bounce.duration * Double(index) * 0.37
+                bounce.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                bar.add(bounce, forKey: "bounce")
+            } else if from > resting {
+                // Settles to a dot rather than dropping to one.
+                let settle = CABasicAnimation(keyPath: "bounds.size.height")
+                settle.fromValue = from
+                settle.toValue = resting
+                settle.duration = 0.25
+                settle.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                bar.add(settle, forKey: "settle")
+            }
+        }
+    }
+}
+
+/// Clicking the title opens the player out, or folds it again.
 private struct Folds: ViewModifier {
-    @ObservedObject var settings: DisplaySettings
+    let toggle: () -> Void
 
     func body(content: Content) -> some View {
         content
             .contentShape(Rectangle())
-            .onTapGesture { withAnimation(NowPlayingCard.fold) { settings.compactCard.toggle() } }
+            .onTapGesture { withAnimation(NowPlayingCard.fold) { toggle() } }
     }
 }
 
@@ -1426,16 +2228,18 @@ private struct TransportButton: View {
     var width: CGFloat = 52
     /// Scales the glyph alone; unlike its point size, this can be animated.
     var scale: CGFloat = 1
+    /// For the play button: drawn as a shape that turns from the triangle
+    /// into the two bars and back, instead of one symbol swapped for another.
+    var playing: Bool? = nil
     let action: () -> Void
     @Environment(\.isEnabled) private var isEnabled
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
-            // Styled on the image itself: a plain button in a menu draws its
+            // Styled on the glyph itself: a plain button in a menu draws its
             // label in the primary colour whatever it is given from outside.
-            Image(systemName: symbol)
-                .font(.system(size: size, weight: .regular))
+            glyph
                 .scaleEffect(scale)
                 .foregroundStyle(Color.primary.opacity(hovering && isEnabled ? 0.85 : 0.5))
                 .frame(width: width, height: 32)
@@ -1445,12 +2249,79 @@ private struct TransportButton: View {
         .opacity(isEnabled ? 1 : 0.5)
         .onHover { hovering = $0 }
     }
+
+    @ViewBuilder private var glyph: some View {
+        if let playing {
+            // About the size the symbols are drawn at this point size.
+            let height = size * 0.74
+            let shape = PlayPauseShape(progress: playing ? 1 : 0)
+            // Filled, and outlined in the same colour with round joins: the
+            // corners come out softened like the symbols', and the seam down
+            // the middle of the triangle is covered.
+            ZStack {
+                shape.fill()
+                shape.stroke(style: StrokeStyle(lineWidth: height * 0.1, lineJoin: .round))
+            }
+            .frame(width: height * 0.84, height: height)
+            .animation(.spring(response: 0.32, dampingFraction: 0.8), value: playing)
+        } else {
+            Image(systemName: symbol).font(.system(size: size, weight: .regular))
+        }
+    }
+}
+
+/// The play triangle at 0, the pause bars at 1, and every shape between.
+/// The triangle is cut down the middle into two pieces, each with four
+/// corners, and each piece's corners travel to those of one bar: the left
+/// half straightens into the left bar, the right tip widens into the right.
+private struct PlayPauseShape: Shape {
+    var progress: CGFloat
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let w = rect.width, h = rect.height
+        // The triangle sits a little right of centre, as the symbol does,
+        // so that it looks centred.
+        let nudge = w * 0.06 * (1 - progress)
+        func point(_ play: CGPoint, _ pause: CGPoint) -> CGPoint {
+            CGPoint(x: rect.minX + play.x + (pause.x - play.x) * progress + nudge,
+                    y: rect.minY + play.y + (pause.y - play.y) * progress)
+        }
+        let bar = w * 0.34
+        let left = [
+            point(CGPoint(x: 0, y: 0), CGPoint(x: 0, y: 0)),
+            point(CGPoint(x: w / 2, y: h / 4), CGPoint(x: bar, y: 0)),
+            point(CGPoint(x: w / 2, y: h * 3 / 4), CGPoint(x: bar, y: h)),
+            point(CGPoint(x: 0, y: h), CGPoint(x: 0, y: h))
+        ]
+        let right = [
+            point(CGPoint(x: w / 2, y: h / 4), CGPoint(x: w - bar, y: 0)),
+            point(CGPoint(x: w, y: h / 2), CGPoint(x: w, y: 0)),
+            point(CGPoint(x: w, y: h / 2), CGPoint(x: w, y: h)),
+            point(CGPoint(x: w / 2, y: h * 3 / 4), CGPoint(x: w - bar, y: h))
+        ]
+        var path = Path()
+        for piece in [left, right] {
+            path.move(to: piece[0])
+            for corner in piece.dropFirst() { path.addLine(to: corner) }
+            path.closeSubpath()
+        }
+        return path
+    }
 }
 
 /// The played part of the track over the rest of it, with the time gone and
 /// the time left beneath. Dragging it moves the player.
 private struct ScrubBar: View {
-    @ObservedObject var player: NowPlayingModel
+    let progress: NowPlayingModel.Progress?
+    /// The app's own colour where it has one, else the system accent — the
+    /// blue Control Center draws the played part in.
+    var tint: NSColor? = nil
+    let seek: (Double) -> Void
     /// Where the finger is while dragging; the bar follows it rather than
     /// the player until the player has been told.
     @State private var dragging: Double?
@@ -1459,7 +2330,6 @@ private struct ScrubBar: View {
         // Redrawn twice a second while the menu is open, and not at all
         // otherwise: the view only exists while the menu does.
         TimelineView(.periodic(from: .now, by: 0.5)) { context in
-            let progress = player.progress
             let duration = progress?.duration ?? 0
             let elapsed = dragging.map { $0 * duration } ?? progress?.elapsed(at: context.date) ?? 0
             let fraction = duration > 0 ? elapsed / duration : 0
@@ -1467,7 +2337,7 @@ private struct ScrubBar: View {
                 GeometryReader { geometry in
                     ZStack(alignment: .leading) {
                         Capsule().fill(Color.primary.opacity(0.15))
-                        Capsule().fill(Color.primary.opacity(0.55))
+                        Capsule().fill(tint.map(Color.init) ?? Color.accentColor)
                             .frame(width: max(geometry.size.width * fraction, 0))
                     }
                     .frame(height: dragging == nil ? 4 : 6)
@@ -1479,7 +2349,7 @@ private struct ScrubBar: View {
                             dragging = min(max(value.location.x / geometry.size.width, 0), 1)
                         }
                         .onEnded { _ in
-                            if let dragging, duration > 0 { player.seek(to: dragging * duration) }
+                            if let dragging, duration > 0 { seek(dragging * duration) }
                             // Hold the dragged place until the player reports
                             // the new one, or the bar jumps back and forth.
                             onMain(after: 0.8) { dragging = nil }
@@ -1511,59 +2381,162 @@ private struct ScrubBar: View {
 
 /// A single line that scrolls when it does not fit, the way Control Center
 /// moves a long title: a pause at the start, one pass, and round again.
-private struct MarqueeText: View {
+///
+/// The text is drawn once into a picture and Core Animation slides it, in
+/// the window server; drawn by SwiftUI every frame, as it was, scrolling
+/// titles cost the app a large share of a core while the card was open.
+private struct MarqueeText: NSViewRepresentable {
     let text: String
     let font: NSFont
+    /// When false a title too long to fit stands still, cut short.
+    var moves = true
 
+    func makeNSView(context: Context) -> MarqueeView { MarqueeView() }
+
+    func updateNSView(_ view: MarqueeView, context: Context) {
+        view.configure(text: text, font: font, moves: moves)
+    }
+
+    /// As wide as it is offered, one line high: left to itself it took all
+    /// the height it was offered too, and opened out the title sank to the
+    /// bottom of the card, over the bar.
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: MarqueeView, context: Context) -> CGSize? {
+        CGSize(width: proposal.width ?? nsView.naturalWidth, height: nsView.intrinsicContentSize.height)
+    }
+}
+
+private final class MarqueeView: NSView {
     private static let gap: CGFloat = 32
     private static let speed: CGFloat = 30   // points per second
-    private static let pause: Double = 2
-    @State private var start = Date()
+    private static let pause: CFTimeInterval = 2
 
-    private var width: CGFloat {
-        ceil((text as NSString).size(withAttributes: [.font: font]).width)
-    }
+    private var text = ""
+    private var font = NSFont.systemFont(ofSize: 13)
+    private var moves = true
 
-    var body: some View {
-        GeometryReader { geometry in
-            let overflows = width > geometry.size.width
-            TimelineView(.animation(paused: !overflows)) { context in
-                let offset = overflows ? offset(at: context.date) : 0
-                HStack(spacing: Self.gap) {
-                    label
-                    if overflows { label }
-                }
-                .fixedSize()
-                .offset(x: offset)
-                .frame(width: geometry.size.width, alignment: .leading)
-                .clipped()
-                .mask(fade(leading: offset < 0, trailing: overflows))
-            }
+    private let strip = CALayer()
+    private let first = CALayer()
+    private let second = CALayer()
+    private let fade = CAGradientLayer()
+    /// What the running scroll was set up for, so that SwiftUI asking again
+    /// with the same text does not start it over from the beginning.
+    private var running: String?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.masksToBounds = true
+        layer?.addSublayer(strip)
+        strip.addSublayer(first)
+        strip.addSublayer(second)
+        strip.anchorPoint = .zero
+        for piece in [first, second] {
+            piece.anchorPoint = .zero
+            piece.contentsGravity = .bottomLeft
         }
-        .frame(height: ceil(font.ascender - font.descender + font.leading) + 1)
-        .onChange(of: text) { _ in start = Date() }
+        fade.startPoint = CGPoint(x: 0, y: 0.5)
+        fade.endPoint = CGPoint(x: 1, y: 0.5)
+        setContentHuggingPriority(.defaultLow, for: .horizontal)
+        setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .vertical)
     }
 
-    private var label: some View {
-        Text(text).font(Font(font)).lineLimit(1)
+    required init?(coder: NSCoder) { fatalError() }
+
+    private var lineHeight: CGFloat { ceil(font.ascender - font.descender + font.leading) + 1 }
+    private var textWidth: CGFloat { ceil((text as NSString).size(withAttributes: [.font: font]).width) }
+    var naturalWidth: CGFloat { textWidth }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: NSView.noIntrinsicMetric, height: lineHeight)
     }
 
-    private func offset(at date: Date) -> CGFloat {
-        let travel = width + Self.gap
-        let cycle = Self.pause + Double(travel / Self.speed)
-        let phase = date.timeIntervalSince(start).truncatingRemainder(dividingBy: cycle)
-        return phase < Self.pause ? 0 : -CGFloat(phase - Self.pause) * Self.speed
+    func configure(text: String, font: NSFont, moves: Bool) {
+        let redraw = text != self.text || font != self.font
+        self.text = text
+        self.font = font
+        self.moves = moves
+        if redraw {
+            invalidateIntrinsicContentSize()
+            render()
+        }
+        needsLayout = true
     }
 
-    /// A soft edge wherever the title runs on past it: at the end while it
-    /// waits, at both ends while it moves.
-    private func fade(leading: Bool, trailing: Bool) -> some View {
-        LinearGradient(stops: [
-            .init(color: leading ? .clear : .black, location: 0),
-            .init(color: .black, location: 0.06),
-            .init(color: .black, location: 0.94),
-            .init(color: trailing ? .clear : .black, location: 1)
-        ], startPoint: .leading, endPoint: .trailing)
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        render()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        render()
+    }
+
+    /// The title as a picture, in the label colour of the current
+    /// appearance.
+    private func render() {
+        let size = NSSize(width: max(textWidth, 1), height: lineHeight)
+        let appearance = effectiveAppearance
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.labelColor]
+        let line = text
+        let image = NSImage(size: size, flipped: true) { rect in
+            appearance.performAsCurrentDrawingAppearance {
+                (line as NSString).draw(in: rect, withAttributes: attributes)
+            }
+            return true
+        }
+        let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        let picture = image.layerContents(forContentsScale: scale)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for piece in [first, second] {
+            piece.contents = picture
+            piece.contentsScale = scale
+        }
+        CATransaction.commit()
+        running = nil
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        let width = bounds.width
+        let overflows = textWidth > width
+        let scrolls = overflows && moves && width > 0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        first.frame = CGRect(x: 0, y: 0, width: textWidth, height: lineHeight)
+        second.frame = CGRect(x: textWidth + Self.gap, y: 0, width: textWidth, height: lineHeight)
+        second.isHidden = !scrolls
+        // A soft edge wherever the title runs on past it.
+        if overflows {
+            fade.frame = bounds
+            fade.colors = [scrolls ? NSColor.clear.cgColor : NSColor.black.cgColor,
+                           NSColor.black.cgColor, NSColor.black.cgColor, NSColor.clear.cgColor]
+            fade.locations = [0, 0.06, 0.94, 1]
+            layer?.mask = fade
+        } else {
+            layer?.mask = nil
+        }
+        CATransaction.commit()
+
+        let key = scrolls ? "\(text)|\(textWidth)" : nil
+        guard key != running else { return }
+        running = key
+        strip.removeAnimation(forKey: "scroll")
+        guard scrolls else { return }
+        // Waits at the start, passes once, and round again; the second copy
+        // makes the end meet the beginning.
+        let travel = textWidth + Self.gap
+        let pass = CFTimeInterval(travel / Self.speed)
+        let scroll = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        scroll.values = [0, 0, -travel]
+        scroll.keyTimes = [0, NSNumber(value: Self.pause / (Self.pause + pass)), 1]
+        scroll.duration = Self.pause + pass
+        scroll.repeatCount = .infinity
+        strip.add(scroll, forKey: "scroll")
     }
 }
 

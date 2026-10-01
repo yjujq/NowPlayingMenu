@@ -23,6 +23,15 @@ BOOL MRBSendCommand(MRBCommand command) {
     return sendCommand ? sendCommand(command, NULL) : NO;
 }
 
+BOOL MRBSkip(BOOL forward, double seconds) {
+    void *framework = MRBFramework();
+    MRSendCommand sendCommand = framework ? (MRSendCommand)dlsym(framework, "MRMediaRemoteSendCommand") : NULL;
+    CFStringRef *intervalKey = framework ? dlsym(framework, "kMRMediaRemoteOptionSkipInterval") : NULL;
+    if (!sendCommand || !intervalKey) return NO;
+    NSDictionary *options = @{ (__bridge NSString *)*intervalKey: @(seconds) };
+    return sendCommand(forward ? MRBCommandSkipForward : MRBCommandSkipBackward, (__bridge CFDictionaryRef)options);
+}
+
 BOOL MRBTogglePlayPause(void) {
     return MRBSendCommand(MRBCommandTogglePlayPause);
 }
