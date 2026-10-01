@@ -13,9 +13,14 @@ APP="NowPlayingMenu.app"
 STAGE="$(mktemp -d /tmp/nowplayingmenu-build.XXXXXX)"
 trap 'rm -rf "$STAGE"' EXIT
 
+# Built outside the project for the same reason: the Desktop syncs too, and
+# swift build's own signing of the resource bundle fails on the same
+# attributes.
+BUILD="$HOME/Library/Caches/NowPlayingMenu-build"
+
 echo "==> building"
-swift build -c release
-BIN_DIR="$(swift build -c release --show-bin-path)"
+swift build -c release --scratch-path "$BUILD"
+BIN_DIR="$(swift build -c release --scratch-path "$BUILD" --show-bin-path)"
 
 echo "==> staging the bundle in a temporary folder"
 mkdir -p "$STAGE/$APP/Contents/MacOS" "$STAGE/$APP/Contents/Resources"
@@ -29,6 +34,11 @@ if [ -d "$PROJECT/AppIcon.iconset" ]; then
     iconutil -c icns "$PROJECT/AppIcon.iconset" -o "$PROJECT/AppIcon.icns"
 fi
 [ -f "$PROJECT/AppIcon.icns" ] && cp "$PROJECT/AppIcon.icns" "$STAGE/$APP/Contents/Resources/AppIcon.icns"
+
+# The artwork helper is a library perl loads, not the app: it goes where a
+# bundle keeps its libraries, and the app looks for it there.
+mkdir -p "$STAGE/$APP/Contents/Frameworks"
+cp "$BIN_DIR/libArtworkHelper.dylib" "$STAGE/$APP/Contents/Frameworks/libArtworkHelper.dylib"
 
 RES="NowPlayingMenu_NowPlayingMenu.bundle"
 [ -d "$BIN_DIR/$RES" ] && cp -R "$BIN_DIR/$RES" "$STAGE/$APP/Contents/Resources/$RES"

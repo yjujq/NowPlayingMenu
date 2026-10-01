@@ -15,6 +15,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+/// Runs `body` on the main thread in every run loop mode, now or after
+/// `delay`. `DispatchQueue.main` is not served while a menu is tracking, so
+/// anything sent that way waits for the menu to close — the card showed the
+/// track as it was when it opened, and kept its old height when folded.
+func onMain(after delay: TimeInterval = 0, _ body: @escaping @MainActor () -> Void) {
+    let run = { MainActor.assumeIsolated { body() } }
+    let main = CFRunLoopGetMain()
+    if delay > 0 {
+        let timer = Timer(timeInterval: delay, repeats: false) { _ in run() }
+        CFRunLoopAddTimer(main, timer, .commonModes)
+    } else {
+        CFRunLoopPerformBlock(main, CFRunLoopMode.commonModes.rawValue, run)
+        CFRunLoopWakeUp(main)
+    }
+}
+
 @main
 enum NowPlayingMenuMain {
     static func main() {
@@ -40,6 +56,9 @@ final class NowPlayingModel: ObservableObject {
     /// it does not: a good many of them publish a position and no duration,
     /// and a fraction of an unknown whole is not something that can be drawn.
     @Published private(set) var progress: Progress?
+    /// The bundle identifier of the app that is playing, for bringing it
+    /// forward. A browser rather than WebKit when the sound is from the web.
+    @Published private(set) var source: String?
 
     /// A reading of the position, not the position itself.
     ///
@@ -79,6 +98,11 @@ final class NowPlayingModel: ObservableObject {
     }
 
     private var pollTimer: Timer?
+    /// The track the artwork belongs to, and the name the source gave the
+    /// picture. The name changes on its own when a source publishes the
+    /// picture a moment after the title, which Spotify does.
+    private var artworkTrack = ""
+    private var artworkIdentifier: String?
 
     init(settings: DisplaySettings) {
         self.settings = settings
@@ -100,9 +124,7 @@ final class NowPlayingModel: ObservableObject {
     func refresh() {
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let info = SystemNowPlaying.fetch()
-            DispatchQueue.main.async {
-                self?.apply(info)
-            }
+            onMain { self?.apply(info) }
         }
     }
 
@@ -115,9 +137,96 @@ final class NowPlayingModel: ObservableObject {
         title = newTitle.isEmpty ? "Nothing playing" : newTitle
         artist = info["artist"] as? String ?? ""
         album = info["album"] as? String ?? ""
-        artwork = nil
+        source = hasTrack ? info["source"] as? String : nil
         progress = Self.progress(from: info, playbackRate: playbackRate, hasTrack: hasTrack)
+        updateArtwork(identifier: info["artworkIdentifier"] as? String)
         schedulePolling()
+    }
+
+    /// Fetched only when the track or its picture changes: it takes a process
+    /// of its own and comes to a megabyte, so it is not asked for every poll.
+    private func updateArtwork(identifier: String?) {
+        let track = hasTrack ? [title, artist, album].joined(separator: "\u{1F}") : ""
+        guard track != artworkTrack || identifier != artworkIdentifier else { return }
+        // A new track drops the old picture at once rather than leaving it
+        // beside the wrong title while the new one loads.
+        if track != artworkTrack { artwork = nil }
+        artworkTrack = track
+        artworkIdentifier = identifier
+        guard hasTrack else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let data = SystemArtwork.fetch()
+            onMain { [weak self] in
+                guard let self, self.artworkTrack == track else { return }
+                self.artwork = data.flatMap(NSImage.init(data:))
+            }
+        }
+    }
+
+    // MARK: Commands
+
+    func togglePlayPause() {
+        if !MRBTogglePlayPause() {
+            // Fallback for systems that don't expose the direct command symbol.
+            postMediaKey(16)
+        }
+        refreshSoon()
+    }
+
+    func nextTrack() {
+        if !MRBSendCommand(.nextTrack) { postMediaKey(17) }
+        refreshSoon()
+    }
+
+    func previousTrack() {
+        if !MRBSendCommand(.previousTrack) { postMediaKey(18) }
+        refreshSoon()
+    }
+
+    /// Brings the playing app forward — the way clicking the artwork in
+    /// Control Center does.
+    func openSource() {
+        guard let source else { return }
+        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: source).first {
+            running.activate(options: [.activateAllWindows])
+        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: source) {
+            NSWorkspace.shared.openApplication(at: url, configuration: NSWorkspace.OpenConfiguration())
+        }
+    }
+
+    var sourceName: String? {
+        guard let source else { return nil }
+        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: source).first,
+           let name = running.localizedName { return name }
+        return NSWorkspace.shared.urlForApplication(withBundleIdentifier: source)?
+            .deletingPathExtension().lastPathComponent
+    }
+
+    func seek(to seconds: Double) {
+        guard MRBSetElapsedTime(max(seconds, 0)) else { return }
+        refreshSoon()
+    }
+
+    private func refreshSoon() {
+        onMain(after: 0.4) { [weak self] in self?.refresh() }
+    }
+
+    private func postMediaKey(_ key: Int) {
+        for isKeyDown in [true, false] {
+            let flags = (isKeyDown ? 0xA : 0xB) << 8
+            let event = NSEvent.otherEvent(
+                with: .systemDefined,
+                location: .zero,
+                modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(flags)),
+                timestamp: 0,
+                windowNumber: 0,
+                context: nil,
+                subtype: 8,
+                data1: (key << 16) | flags,
+                data2: -1
+            )
+            event?.cgEvent?.post(tap: .cghidEventTap)
+        }
     }
 
     /// Falls back to now for the timestamp, which every source seen so far
@@ -151,6 +260,13 @@ final class DisplaySettings: ObservableObject {
     @Published var scrollDirection: Int { didSet { save("scrollDirection", scrollDirection) } }
     @Published var scrollSpeed: Double { didSet { save("scrollSpeed", scrollSpeed) } }
     @Published var pageInterval: Double { didSet { save("pageInterval", pageInterval) } }
+    /// Whether the card in the menu is folded to one row. Not a setting in
+    /// the window: it is toggled by clicking the title, and remembered.
+    @Published var compactCard: Bool { didSet { save("compactCard", compactCard) } }
+    /// Which click does what on the status item. Off: a click plays or
+    /// pauses and a secondary (two-finger) click opens the card. On: the
+    /// other way round.
+    @Published var clickOpensCard: Bool { didSet { save("clickOpensCard", clickOpensCard) } }
 
     let separator = " — "
     private let defaults = UserDefaults.standard
@@ -167,12 +283,15 @@ final class DisplaySettings: ObservableObject {
         scrollDirection = defaults.object(forKey: "scrollDirection") as? Int ?? 0
         scrollSpeed = defaults.object(forKey: "scrollSpeed") as? Double ?? 3
         pageInterval = defaults.object(forKey: "pageInterval") as? Double ?? 2
+        compactCard = defaults.object(forKey: "compactCard") as? Bool ?? false
+        clickOpensCard = defaults.object(forKey: "clickOpensCard") as? Bool ?? false
     }
 
     func reset() {
         displayMode = 0; width = 167; fontName = "System"; fontSize = 13
         showsArtist = true; showsAlbum = false; showsProgress = true; alignment = 0
         scrollDirection = 0; scrollSpeed = 3; pageInterval = 2
+        clickOpensCard = false
     }
 
     func font() -> NSFont {
@@ -233,6 +352,46 @@ private enum SystemNowPlaying {
         guard full != lastReport else { return }   // do not repeat the same line every five seconds
         lastReport = full
         FileHandle.standardError.write(Data(("NowPlaying: " + full + "\n").utf8))
+    }
+}
+
+/// The artwork of the current item. The app may not ask mediaremoted for it
+/// (see ArtworkHelper.m), so the system's own perl asks instead, loading the
+/// helper library and calling into it.
+private enum SystemArtwork {
+    static func fetch() -> Data? {
+        guard let library = helperURL() else { return nil }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/perl")
+        process.arguments = ["-e", """
+            use DynaLoader;
+            my $h = DynaLoader::dl_load_file($ARGV[0]) or die DynaLoader::dl_error();
+            my $f = DynaLoader::dl_find_symbol($h, "NPMWriteArtwork") or die "no symbol";
+            DynaLoader::dl_install_xsub("main::artwork", $f);
+            artwork();
+            """, library.path]
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return process.terminationStatus == 0 && !data.isEmpty ? data : nil
+        } catch {
+            return nil
+        }
+    }
+
+    /// In the app it is in Contents/Frameworks; under `swift run` it is
+    /// beside the executable.
+    private static func helperURL() -> URL? {
+        let name = "libArtworkHelper.dylib"
+        let places = [
+            Bundle.main.privateFrameworksURL?.appendingPathComponent(name),
+            Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent(name)
+        ]
+        return places.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
     }
 }
 
@@ -731,53 +890,21 @@ private final class MarqueeStatusItem: NSObject {
     }
 
     @objc private func handleStatusClick() {
-        if NSApp.currentEvent?.type == .rightMouseUp {
+        let secondary = NSApp.currentEvent?.type == .rightMouseUp
+        if secondary != settings.clickOpensCard {
             showMenu()
         } else {
             togglePlayback()
         }
     }
 
-    private func togglePlayback() {
-        if !MRBTogglePlayPause() {
-            // Fallback for systems that don't expose the direct command symbol.
-            postMediaKey(16, isKeyDown: true)
-            postMediaKey(16, isKeyDown: false)
-        }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
-            self?.player.refresh()
-        }
-    }
+    private func togglePlayback() { player.togglePlayPause() }
 
-    private func postMediaKey(_ key: Int, isKeyDown: Bool) {
-        let state = isKeyDown ? 0xA : 0xB
-        let flags = state << 8
-        let data1 = (key << 16) | flags
-        let event = NSEvent.otherEvent(
-            with: .systemDefined,
-            location: .zero,
-            modifierFlags: NSEvent.ModifierFlags(rawValue: UInt(flags)),
-            timestamp: 0,
-            windowNumber: 0,
-            context: nil,
-            subtype: 8,
-            data1: data1,
-            data2: -1
-        )
-        event?.cgEvent?.post(tap: .cghidEventTap)
-    }
-
-    /// The menu is left to AppKit to draw.
-    ///
-    /// It was drawn by the app for a while — a custom view for the header and
-    /// one for every row — and a hand-drawn row does not follow the system:
-    /// its insets, its highlight and its vibrancy are whatever was hardcoded
-    /// here, and they drift from the menus beside it with every release of
-    /// macOS. Standard items carrying symbols and shortcuts give the same
-    /// shape and stay right.
+    /// The menu is the card Control Center shows for Now Playing and nothing
+    /// else. Settings is the gear on the artwork; Quit is in Settings.
     private func showMenu() {
         let menu = NSMenu()
-        // The header carries no action; without this AppKit would grey it out.
+        // The card carries no action; without this AppKit would grey it out.
         menu.autoenablesItems = false
         // The menu is popped up from the status button and would otherwise
         // inherit the button's appearance — which is the menu bar's, a
@@ -787,77 +914,48 @@ private final class MarqueeStatusItem: NSObject {
         // A menu belongs to the app, so it takes the app's appearance.
         menu.appearance = NSApp.effectiveAppearance
 
+        // The gear only closes the menu; the window opens once the menu has
+        // gone, since a window brought forward during tracking sits behind it.
+        // So does the artwork, before bringing the player forward.
+        var wantsSettings = false
+        var wantsSource = false
         let header = NSMenuItem()
-        header.attributedTitle = headerTitle()
-        header.image = Self.menuSymbol(
-            player.hasTrack ? (player.isPlaying ? "waveform" : "pause.fill") : "music.note"
-        )
+        var card: NSHostingView<NowPlayingCard>!
+        card = NSHostingView(rootView: NowPlayingCard(
+            player: player, settings: settings,
+            openSettings: { wantsSettings = true; menu.cancelTracking() },
+            openSource: { wantsSource = true; menu.cancelTracking() },
+            // Folding the card changes its height, and a menu takes the size
+            // of an item's view from its frame, not from what the view would
+            // like. Asked for once the card has laid itself out again.
+            resized: {
+                onMain {
+                    card.setFrameSize(card.fittingSize)
+                    menu.itemChanged(header)
+                }
+            }
+        ))
+        card.frame = NSRect(origin: .zero, size: card.fittingSize)
+        header.view = card
         menu.addItem(header)
-        menu.addItem(.separator())
-
-        addItem(to: menu, "Settings…", symbol: "slider.horizontal.3", key: ",",
-                action: #selector(showSettings))
-        addItem(to: menu, "Refresh", symbol: "arrow.clockwise", key: "r",
-                action: #selector(refresh))
-        // Quit belongs apart from the two commands that act on the display,
-        // the way it sits apart in the system menus.
-        menu.addItem(.separator())
-        addItem(to: menu, "Quit", symbol: "power", key: "q", action: #selector(quit))
 
         guard let button = statusItem.button else { return }
+        // The poll timer runs in the default mode and a menu keeps the run
+        // loop in its tracking mode, so while the card is open it would show
+        // the track as it was when the menu opened. It is polled on its own
+        // meanwhile, and a little oftener: someone is looking at it.
+        player.refresh()
+        let poll = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.player.refresh() }
+        }
+        RunLoop.main.add(poll, forMode: .common)
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
+        poll.invalidate()
+        if wantsSettings { showSettings() }
+        if wantsSource { player.openSource() }
     }
 
-    private func addItem(to menu: NSMenu, _ title: String, symbol: String,
-                         key: String, action: Selector) {
-        let item = NSMenuItem(title: title, action: action, keyEquivalent: key)
-        item.target = self
-        item.image = Self.menuSymbol(symbol)
-        menu.addItem(item)
-    }
-
-    /// The track at the top of the menu, on two lines: what is playing, and
-    /// who by. A plain disabled line of text read as an error message rather
-    /// than as the thing the app is about.
-    private func headerTitle() -> NSAttributedString {
-        let title = NSMutableAttributedString(
-            string: player.hasTrack ? player.title : "Nothing playing",
-            attributes: [
-                .font: NSFont.systemFont(ofSize: NSFont.menuFont(ofSize: 0).pointSize, weight: .semibold),
-                .foregroundColor: NSColor.labelColor
-            ]
-        )
-        guard let subtitle = menuSubtitle() else { return title }
-        title.append(NSAttributedString(string: "\n" + subtitle, attributes: [
-            .font: NSFont.systemFont(ofSize: 11),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ]))
-        return title
-    }
-
-    /// The second line of the header. It shows what the status item is not
-    /// already showing: with the artist hidden in Settings the menu is the
-    /// one place left to read it.
-    private func menuSubtitle() -> String? {
-        guard player.hasTrack else { return nil }
-        let parts = [player.artist, player.album].filter { !$0.isEmpty }
-        if !parts.isEmpty { return parts.joined(separator: settings.separator) }
-        return player.isPlaying ? "Playing" : "Paused"
-    }
-
-    private static func menuSymbol(_ name: String) -> NSImage? {
-        // A template, so the menu tints it for its own appearance and inverts
-        // it on the highlighted row.
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .regular))
-        image?.isTemplate = true
-        return image
-    }
-
-    @objc private func refresh() { player.refresh() }
-    @objc private func quit() { NSApp.terminate(nil) }
-
-    @objc private func showSettings() {
+    private func showSettings() {
         if let settingsWindow {
             settingsWindow.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
@@ -907,6 +1005,311 @@ private final class MarqueeStatusItem: NSObject {
     }
 }
 
+/// The track as Control Center shows it: the artwork, the title and who by,
+/// the transport, and a bar that can be dragged to move through the track.
+private struct NowPlayingCard: View {
+    @ObservedObject var player: NowPlayingModel
+    @ObservedObject var settings: DisplaySettings
+    let openSettings: () -> Void
+    let openSource: () -> Void
+    let resized: () -> Void
+
+    private static let artworkSide: CGFloat = 100
+    private static let compactArtworkSide: CGFloat = 44
+
+    var body: some View {
+        Group {
+            if settings.compactCard { compact } else { full }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(width: 320)
+        .onChange(of: settings.compactCard) { _ in resized() }
+    }
+
+    private var full: some View {
+        HStack(alignment: .center, spacing: 14) {
+            artwork(side: Self.artworkSide)
+                .overlay(alignment: .topLeading) {
+                    SettingsBadge(action: openSettings).padding(5)
+                }
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 0) {
+                    MarqueeText(text: player.hasTrack ? player.title : "Not Playing",
+                                font: .systemFont(ofSize: 14, weight: .semibold))
+                    subtitleText.padding(.top, 1)
+                }
+                .modifier(Folds(settings: settings))
+                Spacer(minLength: 4)
+                transport
+                Spacer(minLength: 4)
+                ScrubBar(player: player)
+            }
+            .frame(height: Self.artworkSide)
+        }
+    }
+
+    /// One row, the way Control Center shows the track before it is opened:
+    /// a small cover, the title and artist cut short, play and skip.
+    private var compact: some View {
+        HStack(alignment: .center, spacing: 12) {
+            artwork(side: Self.compactArtworkSide)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(player.hasTrack ? player.title : "Not Playing")
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                subtitleText
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .modifier(Folds(settings: settings))
+            HStack(spacing: 0) {
+                TransportButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: 20,
+                                width: 34) { player.togglePlayPause() }
+                TransportButton(symbol: "forward.fill", size: 15, width: 34) { player.nextTrack() }
+            }
+            .disabled(!player.hasTrack)
+        }
+    }
+
+    private func artwork(side: CGFloat) -> some View {
+        ArtworkTile(image: player.artwork, side: side)
+            .contentShape(Rectangle())
+            .onTapGesture { if player.source != nil { openSource() } }
+            .help(player.sourceName.map { "Open \($0)" } ?? "")
+    }
+
+    private var subtitleText: some View {
+        Text(subtitle)
+            .font(.system(size: 12))
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+
+    private var subtitle: String {
+        guard player.hasTrack else { return " " }
+        let parts = [player.artist, player.album].filter { !$0.isEmpty }
+        return parts.isEmpty ? " " : parts.joined(separator: " — ")
+    }
+
+    private var transport: some View {
+        HStack(spacing: 0) {
+            TransportButton(symbol: "backward.fill", size: 17) { player.previousTrack() }
+            TransportButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: 24) {
+                player.togglePlayPause()
+            }
+            TransportButton(symbol: "forward.fill", size: 17) { player.nextTrack() }
+        }
+        .frame(maxWidth: .infinity)
+        .disabled(!player.hasTrack)
+    }
+}
+
+/// The way into Settings: a small gear on a dark disc over the corner of the
+/// artwork, legible on a light cover and a dark one alike.
+private struct SettingsBadge: View {
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "gearshape.fill")
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(hovering ? 1 : 0.85))
+                .frame(width: 22, height: 22)
+                .background(Circle().fill(Color.black.opacity(hovering ? 0.6 : 0.42)))
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help("Settings")
+    }
+}
+
+private struct ArtworkTile: View {
+    let image: NSImage?
+    let side: CGFloat
+
+    var body: some View {
+        ZStack {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Color.primary.opacity(0.08)
+                Image(systemName: "music.note")
+                    .font(.system(size: side * 0.34, weight: .regular))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(width: side, height: side)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.1), lineWidth: 0.5)
+        )
+        .shadow(color: .black.opacity(0.25), radius: 4, y: 1)
+    }
+}
+
+/// Clicking the title folds the card to one row, or opens it out again.
+private struct Folds: ViewModifier {
+    @ObservedObject var settings: DisplaySettings
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .onTapGesture { settings.compactCard.toggle() }
+    }
+}
+
+private struct TransportButton: View {
+    let symbol: String
+    let size: CGFloat
+    var width: CGFloat = 52
+    let action: () -> Void
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            // Styled on the image itself: a plain button in a menu draws its
+            // label in the primary colour whatever it is given from outside.
+            Image(systemName: symbol)
+                .font(.system(size: size, weight: .regular))
+                .foregroundStyle(Color.primary.opacity(hovering && isEnabled ? 0.85 : 0.5))
+                .frame(width: width, height: 32)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .opacity(isEnabled ? 1 : 0.5)
+        .onHover { hovering = $0 }
+    }
+}
+
+/// The played part of the track over the rest of it, with the time gone and
+/// the time left beneath. Dragging it moves the player.
+private struct ScrubBar: View {
+    @ObservedObject var player: NowPlayingModel
+    /// Where the finger is while dragging; the bar follows it rather than
+    /// the player until the player has been told.
+    @State private var dragging: Double?
+
+    var body: some View {
+        // Redrawn twice a second while the menu is open, and not at all
+        // otherwise: the view only exists while the menu does.
+        TimelineView(.periodic(from: .now, by: 0.5)) { context in
+            let progress = player.progress
+            let duration = progress?.duration ?? 0
+            let elapsed = dragging.map { $0 * duration } ?? progress?.elapsed(at: context.date) ?? 0
+            let fraction = duration > 0 ? elapsed / duration : 0
+            VStack(spacing: 4) {
+                GeometryReader { geometry in
+                    ZStack(alignment: .leading) {
+                        Capsule().fill(Color.primary.opacity(0.15))
+                        Capsule().fill(Color.primary.opacity(0.55))
+                            .frame(width: max(geometry.size.width * fraction, 0))
+                    }
+                    .frame(height: dragging == nil ? 4 : 6)
+                    .frame(maxHeight: .infinity)
+                    .contentShape(Rectangle())
+                    .gesture(DragGesture(minimumDistance: 0)
+                        .onChanged { value in
+                            guard duration > 0 else { return }
+                            dragging = min(max(value.location.x / geometry.size.width, 0), 1)
+                        }
+                        .onEnded { _ in
+                            if let dragging, duration > 0 { player.seek(to: dragging * duration) }
+                            // Hold the dragged place until the player reports
+                            // the new one, or the bar jumps back and forth.
+                            onMain(after: 0.8) { dragging = nil }
+                        })
+                }
+                .frame(height: 10)
+                HStack {
+                    Text(progress == nil ? "--:--" : Self.clock(elapsed))
+                    Spacer()
+                    Text(progress == nil ? "--:--" : "−" + Self.clock(max(duration - elapsed, 0)))
+                }
+                .font(.system(size: 11).monospacedDigit())
+                .foregroundStyle(.secondary)
+            }
+            .disabled(progress == nil)
+        }
+    }
+
+    /// Minutes and seconds, with hours in front once there are any — the
+    /// way Control Center counts a mix an hour and a half long.
+    static func clock(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded(.down))
+        let (hours, minutes, secs) = (total / 3600, total / 60 % 60, total % 60)
+        return hours > 0
+            ? String(format: "%02d:%02d:%02d", hours, minutes, secs)
+            : String(format: "%02d:%02d", minutes, secs)
+    }
+}
+
+/// A single line that scrolls when it does not fit, the way Control Center
+/// moves a long title: a pause at the start, one pass, and round again.
+private struct MarqueeText: View {
+    let text: String
+    let font: NSFont
+
+    private static let gap: CGFloat = 32
+    private static let speed: CGFloat = 30   // points per second
+    private static let pause: Double = 2
+    @State private var start = Date()
+
+    private var width: CGFloat {
+        ceil((text as NSString).size(withAttributes: [.font: font]).width)
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            let overflows = width > geometry.size.width
+            TimelineView(.animation(paused: !overflows)) { context in
+                let offset = overflows ? offset(at: context.date) : 0
+                HStack(spacing: Self.gap) {
+                    label
+                    if overflows { label }
+                }
+                .fixedSize()
+                .offset(x: offset)
+                .frame(width: geometry.size.width, alignment: .leading)
+                .clipped()
+                .mask(fade(leading: offset < 0, trailing: overflows))
+            }
+        }
+        .frame(height: ceil(font.ascender - font.descender + font.leading) + 1)
+        .onChange(of: text) { _ in start = Date() }
+    }
+
+    private var label: some View {
+        Text(text).font(Font(font)).lineLimit(1)
+    }
+
+    private func offset(at date: Date) -> CGFloat {
+        let travel = width + Self.gap
+        let cycle = Self.pause + Double(travel / Self.speed)
+        let phase = date.timeIntervalSince(start).truncatingRemainder(dividingBy: cycle)
+        return phase < Self.pause ? 0 : -CGFloat(phase - Self.pause) * Self.speed
+    }
+
+    /// A soft edge wherever the title runs on past it: at the end while it
+    /// waits, at both ends while it moves.
+    private func fade(leading: Bool, trailing: Bool) -> some View {
+        LinearGradient(stops: [
+            .init(color: leading ? .clear : .black, location: 0),
+            .init(color: .black, location: 0.06),
+            .init(color: .black, location: 0.94),
+            .init(color: trailing ? .clear : .black, location: 1)
+        ], startPoint: .leading, endPoint: .trailing)
+    }
+}
+
 /// The settings panel: a stack of grouped cards over the window's blur, the
 /// shape System Settings has used since Ventura. It replaced a plain `Form`,
 /// whose boxed sections and full-width controls read as a decade-old
@@ -917,7 +1320,7 @@ private final class MarqueeStatusItem: NSObject {
 private struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
 
-    static let windowSize = CGSize(width: 400, height: 641)
+    static let windowSize = CGSize(width: 420, height: 760)
 
     /// Scrolling and paging each use a different half of the Motion card.
     /// Rather than hide the rows that do not apply — which would make the
@@ -932,14 +1335,14 @@ private struct SettingsView: View {
             // instead of sitting inside it. The top padding clears the
             // traffic lights and puts the heading on their line.
             Text("Settings")
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 15, weight: .bold, design: .rounded))
                 .frame(maxWidth: .infinity)
                 .padding(.top, 13)
                 .padding(.bottom, 12)
 
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 14) {
                 SettingsCard("Display") {
-                    SettingsRow("Mode") {
+                    SettingsRow("Mode", icon: "textformat.abc", tint: .blue) {
                         Picker("", selection: $settings.displayMode) {
                             Text("Static").tag(0)
                             Text("Scroll").tag(1)
@@ -950,10 +1353,10 @@ private struct SettingsView: View {
                         .frame(width: 190)
                     }
                     SettingsDivider()
-                    SliderRow(title: "Width", value: $settings.width,
+                    SliderRow(title: "Width", icon: "arrow.left.and.right", tint: .cyan, value: $settings.width,
                               range: 100...360, format: "%.0f pt")
                     SettingsDivider()
-                    SettingsRow("Alignment") {
+                    SettingsRow("Alignment", icon: "text.alignleft", tint: .indigo) {
                         Picker("", selection: $settings.alignment) {
                             Text("Left").tag(0)
                             Text("Center").tag(1)
@@ -966,21 +1369,21 @@ private struct SettingsView: View {
                 }
 
                 SettingsCard("Information") {
-                    SettingsRow("Show artist") {
+                    SettingsRow("Show artist", icon: "person.fill", tint: .pink) {
                         Toggle("", isOn: $settings.showsArtist).labelsHidden().toggleStyle(.switch)
                     }
                     SettingsDivider()
-                    SettingsRow("Show album") {
+                    SettingsRow("Show album", icon: "square.stack.fill", tint: .orange) {
                         Toggle("", isOn: $settings.showsAlbum).labelsHidden().toggleStyle(.switch)
                     }
                     SettingsDivider()
-                    SettingsRow("Show progress") {
+                    SettingsRow("Show progress", icon: "chart.bar.fill", tint: .green) {
                         Toggle("", isOn: $settings.showsProgress).labelsHidden().toggleStyle(.switch)
                     }
                 }
 
                 SettingsCard("Type") {
-                    SettingsRow("Typeface") {
+                    SettingsRow("Typeface", icon: "textformat", tint: .purple) {
                         Picker("", selection: $settings.fontName) {
                             Text("System").tag("System")
                             Text("Condensed").tag("Condensed")
@@ -991,12 +1394,12 @@ private struct SettingsView: View {
                         .frame(width: 150)
                     }
                     SettingsDivider()
-                    SliderRow(title: "Size", value: $settings.fontSize,
+                    SliderRow(title: "Size", icon: "textformat.size", tint: .purple, value: $settings.fontSize,
                               range: 9...18, format: "%.0f pt")
                 }
 
                 SettingsCard("Motion") {
-                    SettingsRow("Direction") {
+                    SettingsRow("Direction", icon: "arrow.left.arrow.right", tint: .teal) {
                         Picker("", selection: $settings.scrollDirection) {
                             Text("Left").tag(0)
                             Text("Right").tag(1)
@@ -1007,13 +1410,36 @@ private struct SettingsView: View {
                     }
                     .modifier(Applies(when: scrolls))
                     SettingsDivider()
-                    SliderRow(title: "Scroll speed", value: $settings.scrollSpeed,
+                    SliderRow(title: "Scroll speed", icon: "hare.fill", tint: .teal, value: $settings.scrollSpeed,
                               range: 0.5...10, format: "%.1f ch/s")
                         .modifier(Applies(when: scrolls))
                     SettingsDivider()
-                    SliderRow(title: "Page interval", value: $settings.pageInterval,
+                    SliderRow(title: "Page interval", icon: "timer", tint: .mint, value: $settings.pageInterval,
                               range: 1...10, format: "%.1f s")
                         .modifier(Applies(when: pages))
+                }
+
+                SettingsCard("Click") {
+                    SettingsRow("Click", icon: "cursorarrow.click", tint: .red) {
+                        Picker("", selection: $settings.clickOpensCard) {
+                            Text("Play / Pause").tag(false)
+                            Text("Open card").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 190)
+                    }
+                    SettingsDivider()
+                    HStack {
+                        Text(settings.clickOpensCard
+                             ? "Two-finger click plays or pauses."
+                             : "Two-finger click opens the card.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: 28)
                 }
 
             }
@@ -1026,9 +1452,14 @@ private struct SettingsView: View {
             Spacer(minLength: 20)
 
             HStack {
+                // The menu has no rows any more, so the app is quit from here.
+                Button("Quit Now Playing Menu") { NSApp.terminate(nil) }
+                    .controlSize(.regular)
+                    .fixedSize()
                 Spacer()
                 Button("Reset to Defaults") { settings.reset() }
                     .controlSize(.regular)
+                    .buttonStyle(.borderedProminent)
                     // Its own width, never the squeezed one: the title is
                     // what decides how wide the button is.
                     .fixedSize()
@@ -1060,18 +1491,21 @@ private struct SettingsCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.system(size: 11, weight: .semibold))
+                .textCase(.uppercase)
+                .tracking(0.6)
                 .foregroundStyle(.secondary)
-                .padding(.leading, 4)
+                .padding(.leading, 6)
             VStack(spacing: 0) { content }
                 // Translucent rather than filled: the card sits on the
                 // window's blur and should let it through.
                 .background(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .fill(Color.primary.opacity(0.06))
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(.regularMaterial)
+                        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 10, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.07))
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
                 )
         }
     }
@@ -1080,21 +1514,37 @@ private struct SettingsCard<Content: View>: View {
 /// One row: a label at the leading edge, its control at the trailing one.
 private struct SettingsRow<Control: View>: View {
     private let title: String
+    private let icon: String
+    private let tint: Color
     private let control: Control
 
-    init(_ title: String, @ViewBuilder control: () -> Control) {
+    init(_ title: String, icon: String, tint: Color, @ViewBuilder control: () -> Control) {
         self.title = title
+        self.icon = icon
+        self.tint = tint
         self.control = control()
     }
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 10) {
+            // A filled squircle with a white glyph, the way System Settings
+            // marks its rows.
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(width: 22, height: 22)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(LinearGradient(colors: [tint.opacity(0.85), tint],
+                                             startPoint: .top, endPoint: .bottom))
+                )
+                .shadow(color: tint.opacity(0.3), radius: 1.5, y: 1)
             Text(title).font(.system(size: 13))
             Spacer(minLength: 8)
             control
         }
-        .padding(.horizontal, 12)
-        .frame(height: 36)
+        .padding(.horizontal, 10)
+        .frame(height: 38)
     }
 }
 
@@ -1102,7 +1552,7 @@ private struct SettingsRow<Control: View>: View {
 /// insets its own so it reads as a break in one surface, not a border.
 private struct SettingsDivider: View {
     var body: some View {
-        Divider().opacity(0.45).padding(.leading, 12)
+        Divider().opacity(0.45).padding(.leading, 42)
     }
 }
 
@@ -1119,12 +1569,14 @@ private struct Applies: ViewModifier {
 
 private struct SliderRow: View {
     let title: String
+    let icon: String
+    let tint: Color
     @Binding var value: Double
     let range: ClosedRange<Double>
     let format: String
 
     var body: some View {
-        SettingsRow(title) {
+        SettingsRow(title, icon: icon, tint: tint) {
             HStack(spacing: 10) {
                 Slider(value: $value, in: range).frame(width: 132)
                 // Fixed width and lining figures: without them the row
