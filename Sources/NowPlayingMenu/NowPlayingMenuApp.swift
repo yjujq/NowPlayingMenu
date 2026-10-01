@@ -294,13 +294,46 @@ final class DisplaySettings: ObservableObject {
         clickOpensCard = false
     }
 
+    /// The typefaces Settings offers, in its order. The first four are the
+    /// system's own; the rest are fonts every Mac ships with.
+    static let typefaces = [
+        "System", "Condensed", "Monospaced", "Rounded", "Serif",
+        "Helvetica Neue", "Avenir Next", "Futura", "Gill Sans", "Optima",
+        "Georgia", "Baskerville", "Menlo", "American Typewriter"
+    ]
+
+    /// The installed font behind each typeface that is not the system's.
+    private static let postScriptNames = [
+        "Condensed": "HelveticaNeue-CondensedBold",
+        "Helvetica Neue": "HelveticaNeue",
+        "Avenir Next": "AvenirNext-Regular",
+        "Futura": "Futura-Medium",
+        "Gill Sans": "GillSans",
+        "Optima": "Optima-Regular",
+        "Georgia": "Georgia",
+        "Baskerville": "Baskerville",
+        "Menlo": "Menlo-Regular",
+        "American Typewriter": "AmericanTypewriter"
+    ]
+
     func font() -> NSFont {
         switch fontName {
-        case "Condensed": return NSFont(name: "HelveticaNeue-CondensedBold", size: fontSize) ?? .systemFont(ofSize: fontSize)
         case "Monospaced": return NSFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
-        case "Rounded": return NSFont.systemFont(ofSize: fontSize, weight: .regular)
-        default: return NSFont.menuBarFont(ofSize: fontSize)
+        case "Rounded": return systemFont(design: .rounded)
+        case "Serif": return systemFont(design: .serif)
+        default:
+            if let name = Self.postScriptNames[fontName], let font = NSFont(name: name, size: fontSize) {
+                return font
+            }
+            return NSFont.menuBarFont(ofSize: fontSize)
         }
+    }
+
+    /// The system font in one of its other cuts: SF Rounded, or New York.
+    private func systemFont(design: NSFontDescriptor.SystemDesign) -> NSFont {
+        let base = NSFont.menuBarFont(ofSize: fontSize)
+        guard let descriptor = base.fontDescriptor.withDesign(design) else { return base }
+        return NSFont(descriptor: descriptor, size: fontSize) ?? base
     }
 
     private func save(_ key: String, _ value: Any) { defaults.set(value, forKey: key) }
@@ -551,6 +584,10 @@ private final class MarqueeStatusItem: NSObject {
         accessibilityDescription: "Nothing playing"
     )
     private var settingsWindow: NSWindow?
+    private var card: NSPanel?
+    private var cardHost: NSHostingView<NowPlayingCard>?
+    private var cardMonitors: [Any] = []
+    private var cardResize: Timer?
 
     init(player: NowPlayingModel, settings: DisplaySettings) {
         self.player = player
@@ -892,7 +929,7 @@ private final class MarqueeStatusItem: NSObject {
     @objc private func handleStatusClick() {
         let secondary = NSApp.currentEvent?.type == .rightMouseUp
         if secondary != settings.clickOpensCard {
-            showMenu()
+            toggleCard()
         } else {
             togglePlayback()
         }
@@ -900,59 +937,153 @@ private final class MarqueeStatusItem: NSObject {
 
     private func togglePlayback() { player.togglePlayPause() }
 
-    /// The menu is the card Control Center shows for Now Playing and nothing
-    /// else. Settings is the gear on the artwork; Quit is in Settings.
-    private func showMenu() {
-        let menu = NSMenu()
-        // The card carries no action; without this AppKit would grey it out.
-        menu.autoenablesItems = false
-        // The menu is popped up from the status button and would otherwise
-        // inherit the button's appearance — which is the menu bar's, a
-        // vibrant one that follows the desktop picture rather than the system
-        // setting. That is right for the line drawn in the bar and wrong for
-        // a menu: it left the menu light while the rest of macOS was dark.
-        // A menu belongs to the app, so it takes the app's appearance.
-        menu.appearance = NSApp.effectiveAppearance
+    /// The card Control Center shows for Now Playing and nothing else, in a
+    /// window of its own under the status item. Settings is the gear on the
+    /// artwork; Quit is in Settings.
+    ///
+    /// It used to be the view of an NSMenu item. A menu's shape belongs to
+    /// the system, though: its corners could not be rounded any further, and
+    /// when the card folded the menu could only jump to the new height.
+    private func toggleCard() {
+        if card != nil { closeCard(); return }
+        guard let button = statusItem.button, let barWindow = button.window else { return }
 
-        // The gear only closes the menu; the window opens once the menu has
-        // gone, since a window brought forward during tracking sits behind it.
-        // So does the artwork, before bringing the player forward.
-        var wantsSettings = false
-        var wantsSource = false
-        let header = NSMenuItem()
-        var card: NSHostingView<NowPlayingCard>!
-        card = NSHostingView(rootView: NowPlayingCard(
+        let host = NSHostingView(rootView: NowPlayingCard(
             player: player, settings: settings,
-            openSettings: { wantsSettings = true; menu.cancelTracking() },
-            openSource: { wantsSource = true; menu.cancelTracking() },
-            // Folding the card changes its height, and a menu takes the size
-            // of an item's view from its frame, not from what the view would
-            // like. Asked for once the card has laid itself out again.
-            resized: {
-                onMain {
-                    card.setFrameSize(card.fittingSize)
-                    menu.itemChanged(header)
-                }
-            }
+            openSettings: { [weak self] in self?.closeCard(); self?.showSettings() },
+            openSource: { [weak self] in self?.closeCard(); self?.player.openSource() },
+            resized: { [weak self] in onMain { self?.fitCard() } }
         ))
-        card.frame = NSRect(origin: .zero, size: card.fittingSize)
-        header.view = card
-        menu.addItem(header)
+        // The card says nothing about its size to the window: the window is
+        // sized from outside, in step with the card, and the card fills it.
+        host.sizingOptions = []
+        let size = NSSize(width: NowPlayingCard.width,
+                          height: NowPlayingCard.height(compact: settings.compactCard))
 
-        guard let button = statusItem.button else { return }
-        // The poll timer runs in the default mode and a menu keeps the run
-        // loop in its tracking mode, so while the card is open it would show
-        // the track as it was when the menu opened. It is polled on its own
-        // meanwhile, and a little oftener: someone is looking at it.
-        player.refresh()
-        let poll = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.player.refresh() }
+        let backdrop = NSVisualEffectView(frame: NSRect(origin: .zero, size: size))
+        backdrop.material = .popover
+        backdrop.blendingMode = .behindWindow
+        backdrop.state = .active
+        // The mask shapes the blur, which the window server draws and a
+        // layer's corners do not reach; the layer carries the hairline edge.
+        backdrop.maskImage = Self.roundedMask(radius: Self.cardRadius)
+        backdrop.wantsLayer = true
+        backdrop.layer?.cornerRadius = Self.cardRadius
+        backdrop.layer?.masksToBounds = true
+        backdrop.layer?.borderWidth = 0.5
+        let dark = NSApp.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        backdrop.layer?.borderColor = (dark ? NSColor.white.withAlphaComponent(0.16)
+                                            : NSColor.black.withAlphaComponent(0.1)).cgColor
+        host.frame = backdrop.bounds
+        host.autoresizingMask = [.width, .height]
+        backdrop.addSubview(host)
+
+        let panel = CardPanel(contentRect: NSRect(origin: .zero, size: size),
+                              styleMask: [.borderless, .nonactivatingPanel],
+                              backing: .buffered, defer: false)
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.level = .popUpMenu
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        panel.isReleasedWhenClosed = false
+        panel.contentView = backdrop
+        panel.onCancel = { [weak self] in self?.closeCard() }
+
+        // Under the left edge of the status item, a little below the bar,
+        // and never past the side of the screen.
+        let anchor = barWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        var origin = NSPoint(x: anchor.minX, y: anchor.minY - Self.cardGap - size.height)
+        if let visible = (barWindow.screen ?? NSScreen.main)?.visibleFrame {
+            origin.x = min(max(origin.x, visible.minX + 8), visible.maxX - size.width - 8)
         }
-        RunLoop.main.add(poll, forMode: .common)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height), in: button)
-        poll.invalidate()
-        if wantsSettings { showSettings() }
-        if wantsSource { player.openSource() }
+        panel.setFrameOrigin(origin)
+
+        card = panel
+        cardHost = host
+        player.refresh()
+
+        panel.alphaValue = 0
+        panel.makeKeyAndOrderFront(nil)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.15
+            panel.animator().alphaValue = 1
+        }
+
+        // A click anywhere else puts it away, as it did a menu. Clicks on the
+        // status item are left to the item, which closes it itself.
+        cardMonitors = [
+            NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+                MainActor.assumeIsolated { self?.closeCard() }
+            },
+            NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+                MainActor.assumeIsolated {
+                    if let self, event.window !== self.card, event.window !== button.window {
+                        self.closeCard()
+                    }
+                }
+                return event
+            }
+        ].compactMap { $0 }
+    }
+
+    private func closeCard() {
+        cardResize?.invalidate()
+        cardResize = nil
+        cardMonitors.forEach(NSEvent.removeMonitor)
+        cardMonitors = []
+        guard let panel = card else { return }
+        card = nil
+        cardHost = nil
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.12
+            panel.animator().alphaValue = 0
+        }, completionHandler: {
+            panel.orderOut(nil)
+        })
+    }
+
+    /// Folding the card changes its height. The card animates its pieces
+    /// itself; the window is walked to the new height frame by frame on the
+    /// same curve and over the same time, with its top edge held still.
+    private func fitCard() {
+        guard let panel = card else { return }
+        cardResize?.invalidate()
+        let from = panel.frame.height
+        let target = NowPlayingCard.height(compact: settings.compactCard)
+        guard abs(target - from) > 0.5 else { return }
+        let top = panel.frame.maxY
+        let start = CACurrentMediaTime()
+        let timer = Timer(timeInterval: 1.0 / 120, repeats: true) { timer in
+            MainActor.assumeIsolated {
+                let x = min((CACurrentMediaTime() - start) / NowPlayingCard.foldDuration, 1)
+                let height = (from + (target - from) * easeInOut(x)).rounded()
+                var frame = panel.frame
+                frame.origin.y = top - height
+                frame.size.height = height
+                panel.setFrame(frame, display: true)
+                panel.invalidateShadow()
+                if x >= 1 { timer.invalidate() }
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        cardResize = timer
+    }
+
+    private static let cardRadius: CGFloat = 18
+    private static let cardGap: CGFloat = 5
+
+    /// A rounded rectangle that stretches from its middle, for `maskImage`.
+    private static func roundedMask(radius: CGFloat) -> NSImage {
+        let side = radius * 2 + 1
+        let image = NSImage(size: NSSize(width: side, height: side), flipped: false) { rect in
+            NSColor.black.setFill()
+            NSBezierPath(roundedRect: rect, xRadius: radius, yRadius: radius).fill()
+            return true
+        }
+        image.capInsets = NSEdgeInsets(top: radius, left: radius, bottom: radius, right: radius)
+        image.resizingMode = .stretch
+        return image
     }
 
     private func showSettings() {
@@ -962,22 +1093,36 @@ private final class MarqueeStatusItem: NSObject {
             return
         }
 
-        // Glass: a blur layer blending with whatever is behind the window,
-        // with the interface laid over it. Built in AppKit rather than
-        // wrapped for SwiftUI — a window background is the content view's
-        // job, and going through NSViewRepresentable would only add a layer
-        // that has already given trouble elsewhere in these apps.
-        let backdrop = NSVisualEffectView()
-        backdrop.material = .sidebar
-        backdrop.blendingMode = .behindWindow
-        backdrop.state = .active
-
+        // Glass over the whole window, with the interface laid on it. Built
+        // in AppKit rather than wrapped for SwiftUI — a window background is
+        // the content view's job, and going through NSViewRepresentable
+        // would only add a layer that has already given trouble elsewhere in
+        // these apps.
         let content = NSHostingView(rootView: SettingsView(settings: settings))
         content.autoresizingMask = [.width, .height]
-        backdrop.addSubview(content)
+        let backdrop: NSView
+        if #available(macOS 26, *) {
+            // The system's own glass, the material Finder's sidebar and
+            // Control Center are made of, so the window reads like theirs
+            // rather than as a plain grey sheet. No corner radius of its own:
+            // the window cuts it to the window's shape.
+            let glass = NSGlassEffectView()
+            glass.style = .regular
+            glass.contentView = content
+            backdrop = glass
+        } else {
+            let blur = NSVisualEffectView()
+            blur.material = .sidebar
+            blur.blendingMode = .behindWindow
+            blur.state = .active
+            blur.addSubview(content)
+            backdrop = blur
+        }
 
         let window = NSWindow(
-            contentRect: NSRect(origin: .zero, size: SettingsView.windowSize),
+            // As tall as the panel needs: a height fixed by hand went stale
+            // every time a row was added, and the panel ran off both edges.
+            contentRect: NSRect(origin: .zero, size: content.fittingSize),
             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -1016,60 +1161,113 @@ private struct NowPlayingCard: View {
 
     private static let artworkSide: CGFloat = 100
     private static let compactArtworkSide: CGFloat = 44
+    private static let padding = EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+
+    static let width: CGFloat = 296
+    /// The card's height either way. Known in advance rather than measured,
+    /// so the window can set off for it at the same moment as the card.
+    static func height(compact: Bool) -> CGFloat {
+        (compact ? compactArtworkSide : artworkSide) + padding.top + padding.bottom
+    }
+    /// How long folding takes. The card and its window both use it, on the
+    /// same curve (`.easeInOut`, see `easeInOut(_:)`), so they move as one.
+    static let foldDuration: TimeInterval = 0.45
+    static var fold: Animation { .easeInOut(duration: foldDuration) }
+
+    /// One layout for both shapes, every piece always there, so folding
+    /// moves each one from where it was to where it goes and nothing fades.
+    /// The cover shrinks into its corner, the title slides down beside it,
+    /// play and skip travel to the end of the row, and the window's bottom
+    /// edge, coming up, pushes the bar out of the card. The gear and the
+    /// back button do not travel: they shrink away as folding starts, and
+    /// pop back in near its end. Opening runs it all backwards.
+    ///
+    /// Places are worked out here rather than left to stacks, because a
+    /// piece that changes stacks is a new piece to SwiftUI and can only be
+    /// faded from one to the other.
+    private var compact: Bool { settings.compactCard }
 
     var body: some View {
-        Group {
-            if settings.compactCard { compact } else { full }
-        }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
-        .frame(width: 320)
-        .onChange(of: settings.compactCard) { _ in resized() }
-    }
-
-    private var full: some View {
-        HStack(alignment: .center, spacing: 14) {
-            artwork(side: Self.artworkSide)
+        let layout = Layout(compact: compact)
+        ZStack(alignment: .topLeading) {
+            artwork(side: layout.side)
                 .overlay(alignment: .topLeading) {
-                    SettingsBadge(action: openSettings).padding(5)
+                    SettingsBadge(action: openSettings)
+                        .modifier(PopsIn(shown: !compact))
+                        .padding(5)
                 }
-            VStack(alignment: .leading, spacing: 0) {
-                VStack(alignment: .leading, spacing: 0) {
-                    MarqueeText(text: player.hasTrack ? player.title : "Not Playing",
-                                font: .systemFont(ofSize: 14, weight: .semibold))
-                    subtitleText.padding(.top, 1)
-                }
-                .modifier(Folds(settings: settings))
-                Spacer(minLength: 4)
-                transport
-                Spacer(minLength: 4)
-                ScrubBar(player: player)
-            }
-            .frame(height: Self.artworkSide)
-        }
-    }
-
-    /// One row, the way Control Center shows the track before it is opened:
-    /// a small cover, the title and artist cut short, play and skip.
-    private var compact: some View {
-        HStack(alignment: .center, spacing: 12) {
-            artwork(side: Self.compactArtworkSide)
             VStack(alignment: .leading, spacing: 1) {
-                Text(player.hasTrack ? player.title : "Not Playing")
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                MarqueeText(text: player.hasTrack ? player.title : "Not Playing",
+                            font: .systemFont(ofSize: 14, weight: .semibold))
                 subtitleText
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(width: layout.textWidth, alignment: .leading)
             .modifier(Folds(settings: settings))
-            HStack(spacing: 0) {
-                TransportButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: 20,
-                                width: 34) { player.togglePlayPause() }
-                TransportButton(symbol: "forward.fill", size: 15, width: 34) { player.nextTrack() }
+            .offset(x: layout.textX, y: layout.textY)
+            ScrubBar(player: player)
+                .frame(width: layout.scrubWidth)
+                .offset(x: layout.textX, y: layout.scrubY)
+            Group {
+                TransportButton(symbol: "backward.fill", size: 17, width: layout.button) {
+                    player.previousTrack()
+                }
+                .modifier(PopsIn(shown: !compact, pulses: false))
+                .offset(x: layout.previousX, y: layout.buttonY)
+                TransportButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: 24,
+                                width: layout.button, scale: compact ? 20.0 / 24 : 1) {
+                    player.togglePlayPause()
+                }
+                .offset(x: layout.playX, y: layout.buttonY)
+                TransportButton(symbol: "forward.fill", size: 17,
+                                width: layout.button, scale: compact ? 15.0 / 17 : 1) {
+                    player.nextTrack()
+                }
+                .offset(x: layout.playX + layout.button, y: layout.buttonY)
             }
             .disabled(!player.hasTrack)
         }
+        .frame(width: Layout.width, height: layout.side, alignment: .topLeading)
+        .padding(Self.padding)
+        // Held to the top of the window, which keeps its top edge under the
+        // menu bar and moves its bottom one. What lies past the window's
+        // edges is cut off by it.
+        .frame(width: Self.width, height: Self.height(compact: compact), alignment: .top)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .onChange(of: settings.compactCard) { _ in resized() }
+    }
+
+    /// The places, inside the padding, measured from its top-left corner.
+    private struct Layout {
+        static let width = NowPlayingCard.width - NowPlayingCard.padding.leading
+            - NowPlayingCard.padding.trailing
+        static let gap: CGFloat = 12
+        static let textHeight: CGFloat = 33     // title, a point, and the subtitle
+        static let buttonHeight: CGFloat = 32
+        static let scrubHeight: CGFloat = 27    // the bar and the times under it
+
+        let compact: Bool
+        var side: CGFloat { compact ? NowPlayingCard.compactArtworkSide : NowPlayingCard.artworkSide }
+        var button: CGFloat { compact ? 34 : 52 }
+        /// Far enough past the bottom edge to be out of sight.
+        var away: CGFloat { 48 }
+
+        var textX: CGFloat { side + Self.gap }
+        var textY: CGFloat { compact ? (side - Self.textHeight) / 2 : 0 }
+        var textWidth: CGFloat { (compact ? playX - Self.gap : Self.width) - textX }
+
+        /// Open, the three buttons are centred under the title, and the bar
+        /// sits at the bottom with even room above and below the buttons.
+        /// Folded, play and skip close the row.
+        var playX: CGFloat {
+            compact ? Self.width - 2 * button : textX + (Self.width - textX - 3 * button) / 2 + button
+        }
+        var buttonY: CGFloat {
+            compact ? (side - Self.buttonHeight) / 2
+                    : Self.textHeight + (side - Self.textHeight - Self.buttonHeight - Self.scrubHeight) / 2
+        }
+        var previousX: CGFloat { playX - button }
+        var scrubY: CGFloat { compact ? side + away / 2 : side - Self.scrubHeight }
+        var scrubWidth: CGFloat { Self.width - textX }
     }
 
     private func artwork(side: CGFloat) -> some View {
@@ -1093,37 +1291,93 @@ private struct NowPlayingCard: View {
         return parts.isEmpty ? " " : parts.joined(separator: " — ")
     }
 
-    private var transport: some View {
-        HStack(spacing: 0) {
-            TransportButton(symbol: "backward.fill", size: 17) { player.previousTrack() }
-            TransportButton(symbol: player.isPlaying ? "pause.fill" : "play.fill", size: 24) {
-                player.togglePlayPause()
-            }
-            TransportButton(symbol: "forward.fill", size: 17) { player.nextTrack() }
-        }
-        .frame(maxWidth: .infinity)
-        .disabled(!player.hasTrack)
-    }
 }
 
-/// The way into Settings: a small gear on a dark disc over the corner of the
-/// artwork, legible on a light cover and a dark one alike.
+/// The ease-in-out curve of SwiftUI's `.easeInOut` and Core Animation's
+/// `.easeInEaseOut`: a cubic Bézier through (0.42, 0) and (0.58, 1). For
+/// things outside SwiftUI that have to keep pace with an animation in it.
+private func easeInOut(_ x: Double) -> Double {
+    let (x1, x2) = (0.42, 0.58)
+    func curve(_ t: Double, _ a: Double, _ b: Double) -> Double {
+        3 * (1 - t) * (1 - t) * t * a + 3 * (1 - t) * t * t * b + t * t * t
+    }
+    // Find the point on the curve at time x, then read off its progress.
+    var t = x
+    for _ in 0..<8 {
+        let error = curve(t, x1, x2) - x
+        let slope = 3 * (1 - t) * (1 - t) * x1 + 6 * (1 - t) * t * (x2 - x1) + 3 * t * t * (1 - x2)
+        if abs(error) < 1e-6 || slope == 0 { break }
+        t = min(max(t - error / slope, 0), 1)
+    }
+    return curve(t, 0, 1)
+}
+
+/// The card's window. Borderless, so it says for itself that it may take
+/// the keyboard — for Escape, which puts it away.
+private final class CardPanel: NSPanel {
+    var onCancel: (() -> Void)?
+    override var canBecomeKey: Bool { true }
+    override func cancelOperation(_ sender: Any?) { onCancel?() }
+}
+
+/// The way into Settings: a small gear over the corner of the artwork.
 private struct SettingsBadge: View {
     let action: () -> Void
     @State private var hovering = false
 
     var body: some View {
         Button(action: action) {
+            // No disc under it: a shadow keeps it legible on a light cover.
             Image(systemName: "gearshape.fill")
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(Color.white.opacity(hovering ? 1 : 0.85))
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Color.white.opacity(hovering ? 1 : 0.9))
+                .shadow(color: .black.opacity(0.55), radius: 2, y: 0.5)
                 .frame(width: 22, height: 22)
-                .background(Circle().fill(Color.black.opacity(hovering ? 0.6 : 0.42)))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .help("Settings")
+    }
+}
+
+/// For a piece the folded card has no room for: it shrinks away as folding
+/// starts, and grows back as the card opens out.
+///
+/// One that `pulses` — the gear — grows in past its size and settles back
+/// with a beat or two, once the card is most of the way open and also when
+/// the card is first shown, so it is seen arriving. One that does not — the
+/// back button — is simply there when the card is shown, like the buttons
+/// beside it, and grows back with the card, on its curve, when it unfolds.
+private struct PopsIn: ViewModifier {
+    let shown: Bool
+    let pulses: Bool
+    @State private var scale: CGFloat
+
+    init(shown: Bool, pulses: Bool = true) {
+        self.shown = shown
+        self.pulses = pulses
+        _scale = State(initialValue: shown && !pulses ? 1 : 0)
+    }
+
+    func body(content: Content) -> some View {
+        content
+            .scaleEffect(scale)
+            .allowsHitTesting(shown)
+            .onAppear { if shown && pulses { pulseIn(after: 0.12) } }
+            .onChange(of: shown) { shown in
+                if !shown {
+                    withAnimation(.easeIn(duration: 0.15)) { scale = 0 }
+                } else if pulses {
+                    pulseIn(after: NowPlayingCard.foldDuration * 0.6)
+                } else {
+                    withAnimation(NowPlayingCard.fold) { scale = 1 }
+                }
+            }
+    }
+
+    private func pulseIn(after delay: TimeInterval) {
+        withAnimation(.spring(response: 0.4, dampingFraction: 0.4).delay(delay)) { scale = 1 }
     }
 }
 
@@ -1162,7 +1416,7 @@ private struct Folds: ViewModifier {
     func body(content: Content) -> some View {
         content
             .contentShape(Rectangle())
-            .onTapGesture { settings.compactCard.toggle() }
+            .onTapGesture { withAnimation(NowPlayingCard.fold) { settings.compactCard.toggle() } }
     }
 }
 
@@ -1170,6 +1424,8 @@ private struct TransportButton: View {
     let symbol: String
     let size: CGFloat
     var width: CGFloat = 52
+    /// Scales the glyph alone; unlike its point size, this can be animated.
+    var scale: CGFloat = 1
     let action: () -> Void
     @Environment(\.isEnabled) private var isEnabled
     @State private var hovering = false
@@ -1180,6 +1436,7 @@ private struct TransportButton: View {
             // label in the primary colour whatever it is given from outside.
             Image(systemName: symbol)
                 .font(.system(size: size, weight: .regular))
+                .scaleEffect(scale)
                 .foregroundStyle(Color.primary.opacity(hovering && isEnabled ? 0.85 : 0.5))
                 .frame(width: width, height: 32)
                 .contentShape(Rectangle())
@@ -1320,7 +1577,13 @@ private struct MarqueeText: View {
 private struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
 
-    static let windowSize = CGSize(width: 420, height: 760)
+    static let width: CGFloat = 400
+    /// Every control ends on the same trailing edge and, being this wide,
+    /// starts on the same leading one: segmented controls, pop-up menus and
+    /// sliders with their readout alike.
+    static let controlWidth: CGFloat = 190
+    /// The window's margin, on all four sides.
+    static let margin: CGFloat = 20
 
     /// Scrolling and paging each use a different half of the Motion card.
     /// Rather than hide the rows that do not apply — which would make the
@@ -1332,17 +1595,17 @@ private struct SettingsView: View {
         VStack(spacing: 0) {
             // Drawn here rather than left to the window: the title bar is
             // transparent, so its own title would float above the content
-            // instead of sitting inside it. The top padding clears the
-            // traffic lights and puts the heading on their line.
+            // instead of sitting inside it. The top padding puts the
+            // heading's middle on the traffic lights' line, 14 points down.
             Text("Settings")
-                .font(.system(size: 15, weight: .bold, design: .rounded))
+                .font(.system(size: 13, weight: .semibold))
                 .frame(maxWidth: .infinity)
-                .padding(.top, 13)
-                .padding(.bottom, 12)
+                .padding(.top, 6)
+                .padding(.bottom, 16)
 
-            VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 16) {
                 SettingsCard("Display") {
-                    SettingsRow("Mode", icon: "textformat.abc", tint: .blue) {
+                    SettingsRow("Mode") {
                         Picker("", selection: $settings.displayMode) {
                             Text("Static").tag(0)
                             Text("Scroll").tag(1)
@@ -1350,13 +1613,13 @@ private struct SettingsView: View {
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
-                        .frame(width: 190)
+                        .frame(width: Self.controlWidth)
                     }
                     SettingsDivider()
-                    SliderRow(title: "Width", icon: "arrow.left.and.right", tint: .cyan, value: $settings.width,
+                    SliderRow(title: "Width", value: $settings.width,
                               range: 100...360, format: "%.0f pt")
                     SettingsDivider()
-                    SettingsRow("Alignment", icon: "text.alignleft", tint: .indigo) {
+                    SettingsRow("Alignment") {
                         Picker("", selection: $settings.alignment) {
                             Text("Left").tag(0)
                             Text("Center").tag(1)
@@ -1364,92 +1627,78 @@ private struct SettingsView: View {
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
-                        .frame(width: 190)
+                        .frame(width: Self.controlWidth)
                     }
                 }
 
                 SettingsCard("Information") {
-                    SettingsRow("Show artist", icon: "person.fill", tint: .pink) {
+                    SettingsRow("Show artist") {
                         Toggle("", isOn: $settings.showsArtist).labelsHidden().toggleStyle(.switch)
                     }
                     SettingsDivider()
-                    SettingsRow("Show album", icon: "square.stack.fill", tint: .orange) {
+                    SettingsRow("Show album") {
                         Toggle("", isOn: $settings.showsAlbum).labelsHidden().toggleStyle(.switch)
                     }
                     SettingsDivider()
-                    SettingsRow("Show progress", icon: "chart.bar.fill", tint: .green) {
+                    SettingsRow("Show progress") {
                         Toggle("", isOn: $settings.showsProgress).labelsHidden().toggleStyle(.switch)
                     }
                 }
 
                 SettingsCard("Type") {
-                    SettingsRow("Typeface", icon: "textformat", tint: .purple) {
+                    SettingsRow("Typeface") {
                         Picker("", selection: $settings.fontName) {
-                            Text("System").tag("System")
-                            Text("Condensed").tag("Condensed")
-                            Text("Monospaced").tag("Monospaced")
-                            Text("Rounded").tag("Rounded")
+                            ForEach(DisplaySettings.typefaces, id: \.self) { Text($0).tag($0) }
                         }
                         .labelsHidden()
-                        .frame(width: 150)
+                        .frame(width: Self.controlWidth)
                     }
                     SettingsDivider()
-                    SliderRow(title: "Size", icon: "textformat.size", tint: .purple, value: $settings.fontSize,
+                    SliderRow(title: "Size", value: $settings.fontSize,
                               range: 9...18, format: "%.0f pt")
                 }
 
                 SettingsCard("Motion") {
-                    SettingsRow("Direction", icon: "arrow.left.arrow.right", tint: .teal) {
+                    SettingsRow("Direction") {
                         Picker("", selection: $settings.scrollDirection) {
                             Text("Left").tag(0)
                             Text("Right").tag(1)
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
-                        .frame(width: 190)
+                        .frame(width: Self.controlWidth)
                     }
                     .modifier(Applies(when: scrolls))
                     SettingsDivider()
-                    SliderRow(title: "Scroll speed", icon: "hare.fill", tint: .teal, value: $settings.scrollSpeed,
+                    SliderRow(title: "Scroll speed", value: $settings.scrollSpeed,
                               range: 0.5...10, format: "%.1f ch/s")
                         .modifier(Applies(when: scrolls))
                     SettingsDivider()
-                    SliderRow(title: "Page interval", icon: "timer", tint: .mint, value: $settings.pageInterval,
+                    SliderRow(title: "Page interval", value: $settings.pageInterval,
                               range: 1...10, format: "%.1f s")
                         .modifier(Applies(when: pages))
                 }
 
-                SettingsCard("Click") {
-                    SettingsRow("Click", icon: "cursorarrow.click", tint: .red) {
+                SettingsCard("Menu Bar", footnote: settings.clickOpensCard
+                             ? "A two-finger click plays or pauses."
+                             : "A two-finger click opens the card.") {
+                    SettingsRow("Click") {
                         Picker("", selection: $settings.clickOpensCard) {
                             Text("Play / Pause").tag(false)
-                            Text("Open card").tag(true)
+                            Text("Open Card").tag(true)
                         }
                         .pickerStyle(.segmented)
                         .labelsHidden()
-                        .frame(width: 190)
+                        .frame(width: Self.controlWidth)
                     }
-                    SettingsDivider()
-                    HStack {
-                        Text(settings.clickOpensCard
-                             ? "Two-finger click plays or pauses."
-                             : "Two-finger click opens the card.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 12)
-                    .frame(height: 28)
                 }
 
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, Self.margin)
 
-            // The button belongs to the window rather than to the last card,
-            // so it sits on the bottom edge instead of trailing the Motion
-            // rows. Trailing the cards it also ran a few points past the
-            // bottom of the window and lost its lower edge.
-            Spacer(minLength: 20)
+            // The buttons belong to the window rather than to the last card:
+            // they sit on its bottom margin, a margin away from the cards.
+            Spacer(minLength: Self.margin)
 
             HStack {
                 // The menu has no rows any more, so the app is quit from here.
@@ -1459,15 +1708,17 @@ private struct SettingsView: View {
                 Spacer()
                 Button("Reset to Defaults") { settings.reset() }
                     .controlSize(.regular)
-                    .buttonStyle(.borderedProminent)
                     // Its own width, never the squeezed one: the title is
                     // what decides how wide the button is.
                     .fixedSize()
             }
-            .padding(.horizontal, 20)
-            .padding(.bottom, 18)
+            .padding(.horizontal, Self.margin)
+            .padding(.bottom, Self.margin)
         }
-        .frame(width: Self.windowSize.width, height: Self.windowSize.height)
+        .frame(width: Self.width)
+        // The title bar is see-through and the heading is placed on its line
+        // by hand, so the bar's inset is not wanted on top of that.
+        .ignoresSafeArea()
         // No background of its own: the blur layer beneath the hosting view
         // is what paints this window, and an opaque fill here would hide it.
         // Nor is a scheme forced, unlike the panels in the other two apps —
@@ -1480,10 +1731,12 @@ private struct SettingsView: View {
 /// A titled group of rows on one rounded surface.
 private struct SettingsCard<Content: View>: View {
     private let title: String
+    private let footnote: String?
     private let content: Content
 
-    init(_ title: String, @ViewBuilder content: () -> Content) {
+    init(_ title: String, footnote: String? = nil, @ViewBuilder content: () -> Content) {
         self.title = title
+        self.footnote = footnote
         self.content = content()
     }
 
@@ -1491,22 +1744,27 @@ private struct SettingsCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(title)
                 .font(.system(size: 11, weight: .semibold))
-                .textCase(.uppercase)
-                .tracking(0.6)
                 .foregroundStyle(.secondary)
-                .padding(.leading, 6)
+                .padding(.leading, 4)
             VStack(spacing: 0) { content }
                 // Translucent rather than filled: the card sits on the
                 // window's blur and should let it through.
                 .background(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(.regularMaterial)
-                        .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Color.primary.opacity(0.06))
                 )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.primary.opacity(0.07))
                 )
+            // Under the card, in line with its title, the way System
+            // Settings explains a row.
+            if let footnote {
+                Text(footnote)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 4)
+            }
         }
     }
 }
@@ -1514,37 +1772,21 @@ private struct SettingsCard<Content: View>: View {
 /// One row: a label at the leading edge, its control at the trailing one.
 private struct SettingsRow<Control: View>: View {
     private let title: String
-    private let icon: String
-    private let tint: Color
     private let control: Control
 
-    init(_ title: String, icon: String, tint: Color, @ViewBuilder control: () -> Control) {
+    init(_ title: String, @ViewBuilder control: () -> Control) {
         self.title = title
-        self.icon = icon
-        self.tint = tint
         self.control = control()
     }
 
     var body: some View {
-        HStack(spacing: 10) {
-            // A filled squircle with a white glyph, the way System Settings
-            // marks its rows.
-            Image(systemName: icon)
-                .font(.system(size: 11, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 22, height: 22)
-                .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(LinearGradient(colors: [tint.opacity(0.85), tint],
-                                             startPoint: .top, endPoint: .bottom))
-                )
-                .shadow(color: tint.opacity(0.3), radius: 1.5, y: 1)
+        HStack(spacing: 12) {
             Text(title).font(.system(size: 13))
             Spacer(minLength: 8)
             control
         }
-        .padding(.horizontal, 10)
-        .frame(height: 38)
+        .padding(.horizontal, 12)
+        .frame(height: 36)
     }
 }
 
@@ -1552,7 +1794,7 @@ private struct SettingsRow<Control: View>: View {
 /// insets its own so it reads as a break in one surface, not a border.
 private struct SettingsDivider: View {
     var body: some View {
-        Divider().opacity(0.45).padding(.leading, 42)
+        Divider().opacity(0.45).padding(.leading, 12)
     }
 }
 
@@ -1569,14 +1811,12 @@ private struct Applies: ViewModifier {
 
 private struct SliderRow: View {
     let title: String
-    let icon: String
-    let tint: Color
     @Binding var value: Double
     let range: ClosedRange<Double>
     let format: String
 
     var body: some View {
-        SettingsRow(title, icon: icon, tint: tint) {
+        SettingsRow(title) {
             HStack(spacing: 10) {
                 Slider(value: $value, in: range).frame(width: 132)
                 // Fixed width and lining figures: without them the row
