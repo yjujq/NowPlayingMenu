@@ -1748,7 +1748,7 @@ private struct NowPlayingCard: View {
     static let compactArtworkSide: CGFloat = 44
     static let padding = EdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
 
-    static let width: CGFloat = 296
+    static let width: CGFloat = 328
     static let foldedHeight = compactArtworkSide + padding.top + padding.bottom
     static let openHeight = artworkSide + padding.top + padding.bottom
     /// A folded row for every player, one of them perhaps opened out. Known
@@ -2239,9 +2239,13 @@ private struct TransportButton: View {
         Button(action: action) {
             // Styled on the glyph itself: a plain button in a menu draws its
             // label in the primary colour whatever it is given from outside.
+            // Drawn opaque and faded as one: faded piece by piece, the play
+            // glyph's fill and its rounding outline overlapped twice as dark.
             glyph
                 .scaleEffect(scale)
-                .foregroundStyle(Color.primary.opacity(hovering && isEnabled ? 0.85 : 0.5))
+                .foregroundStyle(Color.primary)
+                .compositingGroup()
+                .opacity(hovering && isEnabled ? 0.85 : 0.5)
                 .frame(width: width, height: 32)
                 .contentShape(Rectangle())
         }
@@ -2255,14 +2259,8 @@ private struct TransportButton: View {
             // About the size the symbols are drawn at this point size.
             let height = size * 0.74
             let shape = PlayPauseShape(progress: playing ? 1 : 0)
-            // Filled, and outlined in the same colour with round joins: the
-            // corners come out softened like the symbols', and the seam down
-            // the middle of the triangle is covered.
-            ZStack {
-                shape.fill()
-                shape.stroke(style: StrokeStyle(lineWidth: height * 0.1, lineJoin: .round))
-            }
-            .frame(width: height * 0.84, height: height)
+            shape.fill()
+                .frame(width: height * 0.84, height: height)
             .animation(.spring(response: 0.32, dampingFraction: 0.8), value: playing)
         } else {
             Image(systemName: symbol).font(.system(size: size, weight: .regular))
@@ -2271,11 +2269,43 @@ private struct TransportButton: View {
 }
 
 /// The play triangle at 0, the pause bars at 1, and every shape between.
+/// (Its corners are rounded by `addRounded`, each by as much as its sides
+/// allow, so a corner closing to a point stays a point.)
 /// The triangle is cut down the middle into two pieces, each with four
 /// corners, and each piece's corners travel to those of one bar: the left
 /// half straightens into the left bar, the right tip widens into the right.
 private struct PlayPauseShape: Shape {
     var progress: CGFloat
+
+    /// A closed outline through the corners, each rounded by its radius or
+    /// by as much as the two sides beside it leave room for. Corners that
+    /// have met — the triangle's tip, made of two — count as one.
+    static func addRounded(_ corners: [CGPoint], radii: [CGFloat], to path: inout Path) {
+        var points: [CGPoint] = []
+        var rounding: [CGFloat] = []
+        for (point, radius) in zip(corners, radii)
+            where points.last.map({ hypot($0.x - point.x, $0.y - point.y) > 0.01 }) ?? true {
+            points.append(point)
+            rounding.append(radius)
+        }
+        if points.count > 1, hypot(points[0].x - points.last!.x, points[0].y - points.last!.y) <= 0.01 {
+            points.removeLast()
+            rounding.removeLast()
+        }
+        guard points.count >= 3 else { return }
+        func distance(_ a: CGPoint, _ b: CGPoint) -> CGFloat { hypot(a.x - b.x, a.y - b.y) }
+        let count = points.count
+        let start = CGPoint(x: (points[count - 1].x + points[0].x) / 2, y: (points[count - 1].y + points[0].y) / 2)
+        path.move(to: start)
+        for index in 0..<count {
+            let previous = points[(index + count - 1) % count]
+            let corner = points[index]
+            let next = points[(index + 1) % count]
+            let room = min(distance(previous, corner), distance(corner, next)) / 2
+            path.addArc(tangent1End: corner, tangent2End: next, radius: max(min(rounding[index], room), 0.001))
+        }
+        path.closeSubpath()
+    }
 
     var animatableData: CGFloat {
         get { progress }
@@ -2304,12 +2334,17 @@ private struct PlayPauseShape: Shape {
             point(CGPoint(x: w, y: h / 2), CGPoint(x: w, y: h)),
             point(CGPoint(x: w / 2, y: h * 3 / 4), CGPoint(x: w - bar, y: h))
         ]
+        // Both pieces in one path, filled once: with no outline laid over
+        // it there is nothing to overlap, and no seam where the halves of
+        // the triangle meet. The corners are rounded in the outline itself.
         var path = Path()
-        for piece in [left, right] {
-            path.move(to: piece[0])
-            for corner in piece.dropFirst() { path.addLine(to: corner) }
-            path.closeSubpath()
-        }
+        // The corners where the two halves meet inside the triangle are
+        // rounded only as the halves part into bars; rounded from the start,
+        // they cut a notch into the middle of the triangle.
+        let round = min(w, h) * 0.07
+        let inner = round * progress
+        Self.addRounded(left, radii: [round, inner, inner, round], to: &path)
+        Self.addRounded(right, radii: [inner, round, round, inner], to: &path)
         return path
     }
 }
