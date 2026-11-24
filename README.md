@@ -40,6 +40,10 @@ None.
 - Artwork is fetched by the system's `/usr/bin/perl`, which loads a small library shipped inside the app: since macOS 15.4 only Apple-signed processes may ask for it.
 - Some sources, such as video in a browser, publish no track length — then there is no progress line.
 
+## Chrome extension
+
+For every Chrome tab with media, without enabling "Allow JavaScript from Apple Events": load `ChromeExtension/` unpacked in `chrome://extensions`. See [ChromeExtension/README.md](ChromeExtension/README.md).
+
 ## Build from source
 
 ```sh

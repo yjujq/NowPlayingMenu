@@ -13,6 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         marquee = MarqueeStatusItem(player: player, settings: settings)
+        let model = player
+        ChromeBridge.shared.onChange = { model.bridgeChanged() }
+        ChromeBridge.shared.start()
     }
 }
 
@@ -93,6 +96,11 @@ final class NowPlayingModel: ObservableObject {
 
         /// The system's pick — the player the fields of the model describe.
         var isSystem = false
+        /// For a browser tab: where it is, to be told its commands directly.
+        var tab: BrowserTabs.Tab? = nil
+        /// For a tab from the Chrome extension: its site's icon, in
+        /// `tabArtwork`, shown when there is no cover.
+        var faviconKey: String? = nil
         var hasTrack: Bool { !title.isEmpty }
 
         /// Skips by a few seconds rather than changing track — a video in a
@@ -102,7 +110,10 @@ final class NowPlayingModel: ObservableObject {
         var canGoBack: Bool { abilities.map { $0.has(skips ? 18 : 5) } ?? true }
         var canGoForward: Bool { abilities.map { $0.has(skips ? 17 : 4) } ?? true }
         var canPlayPause: Bool { abilities.map { $0.has(0) || $0.has(1) || $0.has(2) } ?? true }
-        var canScrub: Bool { abilities.map { $0.has(24) && $0.scrubbable } ?? true }
+        /// Any player that takes Seek. Chrome asks not to be scrubbed — sent
+        /// a stream of positions while the bar is dragged — but the bar sends
+        /// one, when it is let go, and that Chrome takes.
+        var canScrub: Bool { abilities.map { $0.has(24) } ?? true }
     }
 
     /// The commands a player takes, as it lists them for the system — the
@@ -115,6 +126,25 @@ final class NowPlayingModel: ObservableObject {
         let tint: NSColor?
 
         func has(_ command: Int) -> Bool { commands.contains(command) }
+
+        init(commands: Set<Int>, skipInterval: Double?, scrubbable: Bool, tint: NSColor?) {
+            self.commands = commands
+            self.skipInterval = skipInterval
+            self.scrubbable = scrubbable
+            self.tint = tint
+        }
+
+        /// A browser tab's: play and pause, fifteen seconds either way, and
+        /// the bar — all done to its media element directly.
+        static let tab = Abilities(commands: [0, 1, 2, 17, 18, 24], skipInterval: 15,
+                                   scrubbable: true, tint: nil)
+        /// A tab whose page plays without an element in it: only its own
+        /// play and pause button can be pressed.
+        /// A tab whose page has its own next and previous track buttons, as
+        /// Spotify and SoundCloud do: those, before skipping by seconds.
+        static let tabTracks = Abilities(commands: [0, 1, 2, 4, 5, 24], skipInterval: 15,
+                                         scrubbable: true, tint: nil)
+        static let tabButton = Abilities(commands: [0, 1, 2], skipInterval: nil, scrubbable: false, tint: nil)
 
         init?(_ entry: [String: Any]) {
             guard let commands = entry["commands"] as? [NSNumber] else { return nil }
@@ -172,7 +202,11 @@ final class NowPlayingModel: ObservableObject {
     /// pick is left out only when it has nothing and another player has
     /// something.
     var players: [Player] {
-        let all = (hasTrack || others.isEmpty ? [systemPlayer] : []) + others
+        // A browser whose tabs are read is shown by its tabs alone: the one
+        // session it reports to the system is one of them.
+        let read = Set(tabs.compactMap(\.source))
+        let pickShown = (hasTrack || others.isEmpty) && !(source.map(read.contains) ?? false)
+        let all = (pickShown ? [systemPlayer] : []) + others.filter { !read.contains($0.source ?? "") } + tabs
         let place = Dictionary(order.enumerated().map { ($1, $0) }, uniquingKeysWith: { first, _ in first })
         // Not placed yet: the system's pick ahead of all, others at the end.
         func rank(_ item: (offset: Int, element: Player)) -> Int {
@@ -242,8 +276,130 @@ final class NowPlayingModel: ObservableObject {
         if let id = lastPlayedID ?? players.first?.id { openID = id }
     }
 
+    /// The site's icon of a Chrome tab, for when it has no cover.
+    func siteIcon(for player: Player) -> NSImage? { player.faviconKey.flatMap { tabArtwork[$0] } }
+
     func artwork(for player: Player) -> NSImage? {
-        player.isSystem ? artwork : player.artworkKey.flatMap { otherArtwork[$0] }
+        if player.tab != nil { return player.artworkKey.flatMap { tabArtwork[$0] } }
+        return player.isSystem ? artwork : player.artworkKey.flatMap { otherArtwork[$0] }
+    }
+
+    // MARK: Browser tabs
+
+    /// The tabs in Safari and Chrome with media playing or paused in them.
+    @Published private(set) var tabs: [Player] = []
+    /// Their pictures, by address.
+    @Published private(set) var tabArtwork: [String: NSImage] = [:]
+    /// Browsers that refused to be read: "Allow JavaScript from Apple
+    /// Events" is off in them.
+    @Published private(set) var refusingBrowsers: [String] = []
+    private var readingTabs = false
+
+    func refreshTabs() {
+        guard !readingTabs else { return }
+        readingTabs = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let reply = BrowserTabs.read()
+            onMain {
+                self?.readingTabs = false
+                self?.applyTabs(reply)
+            }
+        }
+    }
+
+    /// What browser-tabs.js read last, kept so that the extension's lists,
+    /// which come in on their own, are joined to it without asking again.
+    private var scriptEntries: [[String: Any]] = []
+
+    /// A new list from the Chrome extension.
+    func bridgeChanged() {
+        rebuildTabs()
+    }
+
+    private func applyTabs(_ reply: [String: Any]) {
+        scriptEntries = reply["tabs"] as? [[String: Any]] ?? []
+        let refusing = reply["blocked"] as? [String] ?? []
+        if refusing != refusingBrowsers { refusingBrowsers = refusing }
+        rebuildTabs()
+    }
+
+    private func rebuildTabs() {
+        // The extension's tabs, under browser "ext": window is Chrome's tab
+        // id, tab the element's id the extension gives commands by.
+        let fromExtension: [[String: Any]] = ChromeBridge.shared.current.compactMap { item in
+            guard let id = item["id"] as? String else { return nil }
+            var entry = item
+            entry["browser"] = "ext"
+            entry["window"] = "\((item["tabId"] as? NSNumber)?.intValue ?? 0)"
+            entry["tab"] = id
+            return entry
+        }
+        // While the extension reports Chrome, Chrome is not read twice.
+        let script = fromExtension.isEmpty && !ChromeBridge.shared.isConnected
+            ? scriptEntries : scriptEntries.filter { $0["browser"] as? String != "chrome" }
+        let entries = script + fromExtension
+        var found: [Player] = []
+        for entry in entries {
+            guard let browser = entry["browser"] as? String, let window = entry["window"] as? String,
+                  let index = entry["tab"] as? String, let title = entry["title"] as? String else { continue }
+            let place = BrowserTabs.Tab(browser: browser, window: window, tab: index)
+            let playing = entry["playing"] as? Bool ?? false
+            let duration = (entry["duration"] as? NSNumber)?.doubleValue ?? 0
+            let time = (entry["time"] as? NSNumber)?.doubleValue ?? 0
+            let artist = entry["artist"] as? String ?? ""
+            let artwork = entry["artwork"] as? String
+            let favicon = entry["favicon"] as? String
+            found.append(Player(
+                id: "tab|\(browser)|\(window)|\(index)",
+                source: place.bundleIdentifier,
+                name: place.appName,
+                title: title,
+                artist: artist.isEmpty ? (entry["host"] as? String ?? "") : artist,
+                album: "",
+                isPlaying: playing,
+                progress: duration > 0 ? Progress(reading: time, taken: (entry["at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) } ?? Date(), duration: duration,
+                                                  rate: playing ? 1 : 0) : nil,
+                artworkKey: artwork?.isEmpty == false ? artwork : nil,
+                abilities: (entry["tracks"] as? Bool ?? false) ? .tabTracks
+                    : entry["controls"] as? String == "button" ? .tabButton : .tab,
+                tab: place,
+                faviconKey: favicon?.isEmpty == false ? favicon : nil
+            ))
+        }
+        if found != tabs { tabs = found }
+        showInBar()
+        ChromeBridge.shared.bar = ["title": title, "artist": artist, "playing": isPlaying, "fromTab": barTab != nil]
+        ChromeBridge.shared.shown = players.map {
+            ["name": $0.name, "title": $0.title, "artist": $0.artist, "playing": $0.isPlaying,
+             "duration": $0.progress?.duration ?? 0]
+        }
+        fetchTabArtwork()
+        updateOrder(with: (listed + tabs).map(\.id))
+        notePlaying()
+    }
+
+    /// Pictures are fetched once by address and kept while a tab shows them.
+    private func fetchTabArtwork() {
+        let wanted = Set(tabs.compactMap(\.artworkKey) + tabs.compactMap(\.faviconKey))
+        let kept = tabArtwork.filter { wanted.contains($0.key) }
+        if kept.count != tabArtwork.count { tabArtwork = kept }
+        for address in wanted where tabArtwork[address] == nil {
+            guard let url = URL(string: address), ["http", "https", "data"].contains(url.scheme ?? "") else { continue }
+            URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
+                guard let data, let image = NSImage(data: data) else { return }
+                onMain { self?.tabArtwork[address] = image }
+            }.resume()
+        }
+    }
+
+    /// Brings the browser forward on that tab.
+    func show(_ tab: BrowserTabs.Tab) { command(tab, "focus") }
+
+    private func command(_ tab: BrowserTabs.Tab, _ action: String, _ value: Double = 0) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            BrowserTabs.command(tab, action: action, value: value)
+            onMain { onMain(after: 0.3) { self?.refreshTabs() } }
+        }
     }
 
     /// A reading of the position, not the position itself.
@@ -314,20 +470,75 @@ final class NowPlayingModel: ObservableObject {
         }
     }
 
+    /// The system's last reading, kept so the bar can be worked out again
+    /// when the Chrome extension's list changes between polls.
+    private var systemInfo: [String: Any] = [:]
+    /// The Chrome tab the bar shows instead of the system's pick, if any.
+    @Published private(set) var barTab: Player?
+
     private func apply(_ info: [String: Any]) {
+        systemInfo = info
+        showInBar()
+        schedulePolling()
+    }
+
+    /// The tab the bar should show. Chrome tells the system of one session
+    /// only — the tab that last took it, playing or not — so when Chrome is
+    /// the system's pick, or nothing the system knows is playing, the bar
+    /// follows the extension instead: the tab playing now, or else the one
+    /// it showed last, if that is still there.
+    private func chromeTabForBar() -> Player? {
+        guard ChromeBridge.shared.isConnected else { return nil }
+        let info = systemInfo
+        let systemTitle = info["title"] as? String ?? ""
+        let systemPlaying = !systemTitle.isEmpty && ((info["playbackRate"] as? NSNumber)?.doubleValue ?? 0) > 0
+        let systemIsChrome = info["source"] as? String == "com.google.Chrome"
+        guard systemIsChrome || !systemPlaying else { return nil }
+        let chrome = tabs.filter { $0.tab?.browser == "ext" }
+        let playing = chrome.filter(\.isPlaying)
+        if let tab = playing.first(where: { $0.title == systemTitle }) ?? playing.first { return tab }
+        if let shown = barTab, let still = chrome.first(where: { $0.id == shown.id }) { return still }
+        return nil
+    }
+
+    private func showInBar() {
+        let info = systemInfo
+        if let tab = chromeTabForBar() {
+            // Assigned only when they differ: each assignment redraws the bar.
+            if barTab != tab { barTab = tab }
+            if !hasTrack { hasTrack = true }
+            if isPlaying != tab.isPlaying { isPlaying = tab.isPlaying }
+            if title != tab.title { title = tab.title }
+            if artist != tab.artist { artist = tab.artist }
+            if !album.isEmpty { album = "" }
+            if source != tab.source { source = tab.source }
+            if progress != tab.progress { progress = tab.progress }
+            let picture = tab.artworkKey.flatMap { tabArtwork[$0] }
+            if artwork !== picture { artwork = picture }
+            // So that going back to the system's pick fetches its picture.
+            artworkTrack = ""
+            artworkIdentifier = nil
+            notePlaying()
+            return
+        }
+        if barTab != nil { barTab = nil }
         let newTitle = info["title"] as? String ?? ""
         let playbackRate = (info["playbackRate"] as? NSNumber)?.doubleValue ?? 0
 
-        isPlaying = !newTitle.isEmpty && playbackRate > 0
-        hasTrack = !newTitle.isEmpty
-        title = newTitle.isEmpty ? "Nothing playing" : newTitle
-        artist = info["artist"] as? String ?? ""
-        album = info["album"] as? String ?? ""
-        source = hasTrack ? info["source"] as? String : nil
-        progress = Self.progress(from: info, playbackRate: playbackRate, hasTrack: hasTrack)
+        // Assigned only when they differ: this runs on every list from the
+        // extension too, and each assignment redraws the bar.
+        func set<T: Equatable>(_ path: ReferenceWritableKeyPath<NowPlayingModel, T>, _ value: T) {
+            if self[keyPath: path] != value { self[keyPath: path] = value }
+        }
+        set(\.isPlaying, !newTitle.isEmpty && playbackRate > 0)
+        set(\.hasTrack, !newTitle.isEmpty)
+        set(\.title, newTitle.isEmpty ? "Nothing playing" : newTitle)
+        set(\.artist, info["artist"] as? String ?? "")
+        set(\.album, info["album"] as? String ?? "")
+        set(\.source, hasTrack ? info["source"] as? String : nil)
+        set(\.progress, Self.progress(from: info, playbackRate: playbackRate, hasTrack: hasTrack))
         notePlaying()
         updateArtwork(identifier: info["artworkIdentifier"] as? String)
-        schedulePolling()
     }
 
     /// Fetched only when the track or its picture changes: it takes a process
@@ -379,6 +590,7 @@ final class NowPlayingModel: ObservableObject {
     }
 
     func refreshOthers() {
+        refreshTabs()
         // Pictures already in hand are not sent again.
         let known = otherArtwork.keys.joined(separator: "\n")
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -421,7 +633,7 @@ final class NowPlayingModel: ObservableObject {
         // The opened one stays opened once it has its real name.
         if openID == Player.systemID, let entry = systemEntry { openID = entry.id }
         if targetID != commandTargetID { commandTargetID = targetID }
-        updateOrder(with: players.map(\.id))
+        updateOrder(with: (players + tabs).map(\.id))
         placePickFirst()
         notePlaying()
     }
@@ -440,6 +652,11 @@ final class NowPlayingModel: ObservableObject {
     /// cannot be reached that way, so its button is pressed in Control
     /// Center, which can.
     func togglePlayPause(_ player: Player) {
+        if let tab = player.tab {
+            // Shown at once; the next reading says whether it took.
+            if let index = tabs.firstIndex(where: { $0.id == player.id }) { tabs[index].isPlaying.toggle() }
+            return command(tab, "toggle")
+        }
         guard player.id != controllableID else { return togglePlayPause() }
         // Shown at once; the next poll says whether it took.
         if let index = listed.firstIndex(where: { $0.id == player.id }) { listed[index].isPlaying.toggle() }
@@ -451,6 +668,7 @@ final class NowPlayingModel: ObservableObject {
 
     /// Next track, or a skip forward for a player that skips.
     func goForward(_ player: Player) {
+        if let tab = player.tab { return player.skips ? command(tab, "skip", player.skipInterval) : command(tab, "next") }
         guard player.id == controllableID else {
             return ControlCenterRemote.press(.forward, on: player.title) { [weak self] _ in
                 self?.refresh()
@@ -467,6 +685,7 @@ final class NowPlayingModel: ObservableObject {
 
     /// Previous track, or a skip back for a player that skips.
     func goBack(_ player: Player) {
+        if let tab = player.tab { return player.skips ? command(tab, "skip", -player.skipInterval) : command(tab, "previous") }
         guard player.id == controllableID else { return send(player.skips ? 18 : 5, to: player) }
         if player.skips {
             _ = MRBSkip(false, player.skipInterval)
@@ -477,6 +696,7 @@ final class NowPlayingModel: ObservableObject {
     }
 
     func seek(_ player: Player, to seconds: Double) {
+        if let tab = player.tab { return command(tab, "seek", seconds) }
         player.id == controllableID ? seek(to: seconds) : send(24, to: player, position: max(seconds, 0))
     }
 
@@ -505,6 +725,8 @@ final class NowPlayingModel: ObservableObject {
     /// take no Toggle, and the player this app shows first is not always the
     /// one the command reaches, so its own state would be the wrong guide.
     func togglePlayPause() {
+        // The bar shows a Chrome tab: that tab, not Chrome's one session.
+        if let tab = barTab { return togglePlayPause(tab) }
         guard SystemHelper.available else { return toggleDirectly() }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             _ = SystemHelper.call("NPMTogglePlayPause")
@@ -954,6 +1176,153 @@ enum ControlCenterRemote {
         var names: CFArray?
         guard AXUIElementCopyActionNames(node, &names) == .success else { return [] }
         return names as? [String] ?? []
+    }
+}
+
+/// The tabs of Safari and Chrome, each with its own media, read and told
+/// through the browsers' scripting by browser-tabs.js.
+enum BrowserTabs {
+    struct Tab: Equatable {
+        /// "safari" or "chrome".
+        let browser: String
+        let window: String
+        let tab: String
+
+        var bundleIdentifier: String { browser == "safari" ? "com.apple.Safari" : "com.google.Chrome" }
+        var appName: String {
+            switch browser {
+            case "safari": return "Safari"
+            case "ext": return "Chrome · extension"
+            default: return "Google Chrome"
+            }
+        }
+    }
+
+    /// Tabs that never answered and are not asked again while the app runs.
+    /// Touched only from the reading queue.
+    private static var silent: Set<String> = []
+    /// A browser left with a question it will not answer queues every later
+    /// one behind it, so after a timeout it is left alone for a while.
+    private static var restingUntil: [String: Date] = [:]
+    private static let queue = DispatchQueue(label: "browser-tabs")
+
+    /// Each browser read on its own and given four seconds; what was read
+    /// before a tab failed to answer is kept, and that tab skipped after.
+    /// Returns the tabs found and the browsers that refused.
+    static func read() -> [String: Any] {
+        queue.sync {
+            var tabs: [[String: Any]] = []
+            var blocked: [String] = []
+            // Chrome is left to its extension while that is reporting.
+            for browser in ChromeBridge.shared.isConnected ? ["safari"] : ["safari", "chrome"] {
+                if let until = restingUntil[browser], until > Date() { continue }
+                let skip = silent.filter { $0.hasPrefix(browser + "|") }.joined(separator: ",")
+                let strips = browser == "chrome" ? chromeTabStrips() : nil
+                let (data, finished) = run(["list", browser, skip], timeout: 4,
+                                           environment: strips.map { ["NPM_WINDOWS": $0] } ?? [:])
+                var pending: String?
+                for line in String(decoding: data ?? Data(), as: UTF8.self).split(separator: "\n") {
+                    guard let object = (try? JSONSerialization.jsonObject(with: Data(line.utf8))) as? [String: Any]
+                    else { continue }
+                    if let start = object["start"] as? String { pending = start }
+                    if let tab = object["tab"] as? [String: Any] { tabs.append(tab); pending = nil }
+                    if object["blocked"] != nil { blocked.append(browser) }
+                }
+                // Cut off while asking a tab: that tab is the one that hangs.
+                if !finished {
+                    if let pending { silent.insert(pending) }
+                    restingUntil[browser] = Date().addingTimeInterval(120)
+                }
+            }
+            return ["tabs": tabs, "blocked": blocked]
+        }
+    }
+
+    static func command(_ tab: Tab, action: String, value: Double) {
+        if tab.browser == "ext" { return ChromeBridge.shared.send(id: tab.tab, action: action, value: value) }
+        _ = run(["command", tab.browser, tab.window, tab.tab, action, String(value)], timeout: 4)
+    }
+
+    /// Chrome's windows on this desktop as their tab strips show them, as
+    /// JSON for the script: each window's tab descriptions in order — "title
+    /// – Part of group … - Audio playing - Memory usage …" — and the places
+    /// of the tabs that will answer a script: those playing sound, and the
+    /// one in front in the front window. Chrome freezes the rest when it
+    /// likes — asleep ("Inactive tab"), in a window on another desktop, or
+    /// just long in the background — and a frozen tab never answers.
+    /// Nil when the strips cannot be read, and then every tab is asked.
+    private static func chromeTabStrips() -> String? {
+        guard AXIsProcessTrusted(),
+              let chrome = NSRunningApplication.runningApplications(withBundleIdentifier: "com.google.Chrome").first
+        else { return nil }
+        func children(_ node: AXUIElement, _ attribute: String = kAXChildrenAttribute) -> [AXUIElement] {
+            var value: CFTypeRef?
+            AXUIElementCopyAttributeValue(node, attribute as CFString, &value)
+            return value as? [AXUIElement] ?? []
+        }
+        func string(_ node: AXUIElement, _ attribute: String) -> String {
+            var value: CFTypeRef?
+            AXUIElementCopyAttributeValue(node, attribute as CFString, &value)
+            return value as? String ?? ""
+        }
+        // The browser's own tabs carry a description; tabs drawn by a web
+        // page (X's "Лента", "Поиск") have a title instead, and are not tabs.
+        func tabButtons(_ node: AXUIElement, depth: Int = 0) -> [AXUIElement] {
+            guard depth < 14 else { return [] }
+            if string(node, kAXSubroleAttribute) == "AXTabButton" {
+                return string(node, kAXDescriptionAttribute).isEmpty ? [] : [node]
+            }
+            return children(node).flatMap { tabButtons($0, depth: depth + 1) }
+        }
+        let app = AXUIElementCreateApplication(chrome.processIdentifier)
+        var windows: [[String: Any]] = []
+        for (order, window) in children(app, kAXWindowsAttribute).enumerated() {
+            let buttons = tabButtons(window)
+            guard !buttons.isEmpty else { continue }
+            var descriptions: [String] = []
+            var awake: [Int] = []
+            var soundingTabs: [Int] = []
+            for (index, button) in buttons.enumerated() {
+                let description = string(button, kAXDescriptionAttribute)
+                descriptions.append(description)
+                var selected: CFTypeRef?
+                AXUIElementCopyAttributeValue(button, kAXValueAttribute as CFString, &selected)
+                let inFront = order == 0 && ((selected as? NSNumber)?.boolValue ?? false)
+                let sounding = description.contains("Audio playing")
+                if !description.contains("Inactive tab"), inFront || sounding { awake.append(index) }
+                if sounding { soundingTabs.append(index) }
+            }
+            windows.append(["tabs": descriptions, "awake": awake, "sounding": soundingTabs])
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: windows) else { return nil }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    /// The script's output, and whether it finished rather than being cut
+    /// off at `timeout`.
+    private static func run(_ arguments: [String], timeout: TimeInterval,
+                            environment: [String: String] = [:]) -> (Data?, Bool) {
+        guard let script = Bundle.module.url(forResource: "browser-tabs", withExtension: "js") else { return (nil, true) }
+        let process = Process()
+        let output = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-l", "JavaScript", script.path] + arguments
+        process.environment = ProcessInfo.processInfo.environment.merging(environment) { $1 }
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+            // A browser or tab that does not answer is given up on rather
+            // than waited for, or no tab would ever be read again.
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                if process.isRunning { process.terminate() }
+            }
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return (data, process.terminationReason == .exit)
+        } catch {
+            return (nil, true)
+        }
     }
 }
 
@@ -1836,7 +2205,7 @@ private struct PlayerBlock: View {
     /// Whether this is the player the system sends commands to, and so the
     /// one the back button and the bar can reach. Play and forward reach the
     /// others too, through Control Center.
-    private var controllable: Bool { item.id == model.controllableID }
+    private var controllable: Bool { item.tab != nil || item.id == model.controllableID }
 
     var body: some View {
         let layout = Layout(compact: compact)
@@ -1953,7 +2322,8 @@ private struct PlayerBlock: View {
 
     private func artwork(side: CGFloat) -> some View {
         let picture = model.artwork(for: item)
-        let icon = item.source.flatMap(NowPlayingModel.icon(of:))
+        // No cover: the site's icon if the tab has one, else the app's.
+        let icon = model.siteIcon(for: item) ?? item.source.flatMap(NowPlayingModel.icon(of:))
         // A video's picture is wide, and opened out it is shown whole, the
         // way Control Center shows it: as wide as the square was, less tall,
         // and centred on it. Folded, every picture fills a square.
@@ -1979,7 +2349,11 @@ private struct PlayerBlock: View {
                 }
             }
             .contentShape(Rectangle())
-            .onTapGesture { item.source.map(openSource) }
+            .onTapGesture {
+                // A browser tab: that tab, not just its browser.
+                if let tab = item.tab { model.show(tab) }
+                item.source.map(openSource)
+            }
             .help(item.name.isEmpty ? "" : "Open \(item.name)")
             .frame(width: side, height: side)
     }

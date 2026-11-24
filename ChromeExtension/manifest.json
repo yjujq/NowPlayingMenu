@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "Now Playing Menu Bridge",
+  "version": "1.7",
+  "description": "Tells the Now Playing Menu app what is playing in each Chrome tab.",
+  "permissions": ["tabs", "alarms", "scripting", "favicon"],
+  "host_permissions": ["<all_urls>", "http://127.0.0.1:47811/*"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["main.js"],
+    "world": "MAIN",
+    "all_frames": true,
+    "match_about_blank": true,
+    "run_at": "document_start"
+  }, {
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "all_frames": true,
+    "match_about_blank": true,
+    "run_at": "document_start"
+  }]
+}
