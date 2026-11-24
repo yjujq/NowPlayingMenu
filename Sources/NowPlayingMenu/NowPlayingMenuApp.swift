@@ -339,6 +339,7 @@ final class NowPlayingModel: ObservableObject {
             ? scriptEntries : scriptEntries.filter { $0["browser"] as? String != "chrome" }
         let entries = script + fromExtension
         var found: [Player] = []
+        var hosts: [String: String] = [:]   // player id → site
         for entry in entries {
             guard let browser = entry["browser"] as? String, let window = entry["window"] as? String,
                   let index = entry["tab"] as? String, let title = entry["title"] as? String else { continue }
@@ -349,6 +350,9 @@ final class NowPlayingModel: ObservableObject {
             let artist = entry["artist"] as? String ?? ""
             let artwork = entry["artwork"] as? String
             let favicon = entry["favicon"] as? String
+            let host = (entry["host"] as? String ?? "").lowercased()
+                .replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
+            if !host.isEmpty { hosts["tab|\(browser)|\(window)|\(index)"] = host }
             found.append(Player(
                 id: "tab|\(browser)|\(window)|\(index)",
                 source: place.bundleIdentifier,
@@ -366,6 +370,18 @@ final class NowPlayingModel: ObservableObject {
                 faviconKey: favicon?.isEmpty == false ? favicon : nil
             ))
         }
+        // One player per site: the one playing, else the one that played
+        // last, else the last tab found.
+        func recency(_ player: Player) -> Date {
+            player.isPlaying ? .distantFuture : lastPlayed[player.id] ?? .distantPast
+        }
+        var keep: [String: Player] = [:]
+        for player in found {
+            guard let host = hosts[player.id] else { continue }
+            if let kept = keep[host], recency(kept) > recency(player) { continue }
+            keep[host] = player
+        }
+        found = found.filter { player in hosts[player.id].map { keep[$0]?.id == player.id } ?? true }
         if found != tabs { tabs = found }
         showInBar()
         ChromeBridge.shared.bar = ["title": title, "artist": artist, "playing": isPlaying, "fromTab": barTab != nil]
