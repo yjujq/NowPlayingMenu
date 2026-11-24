@@ -210,8 +210,23 @@ final class NowPlayingModel: ObservableObject {
         putPickFirst = false
     }
 
-    /// Whether one of the players is opened out.
-    var hasOpen: Bool { players.contains { $0.id == openID } }
+    /// Whether the card is collapsed to the one player that is playing.
+    /// Kept between openings of the card.
+    @Published var collapsed: Bool = UserDefaults.standard.bool(forKey: "cardCollapsed") {
+        didSet { UserDefaults.standard.set(collapsed, forKey: "cardCollapsed") }
+    }
+
+    /// The players the card shows: all of them, or, collapsed, only the one
+    /// playing (else the one that played last, else the first).
+    var shownPlayers: [Player] {
+        let all = players
+        guard collapsed, all.count > 1 else { return all }
+        let id = all.first(where: \.isPlaying)?.id ?? lastPlayedID
+        return [all.first { $0.id == id } ?? all[0]]
+    }
+
+    /// Whether one of the shown players is opened out.
+    var hasOpen: Bool { shownPlayers.contains { $0.id == openID } }
 
     /// Opens a player out and folds the one that was; or folds it, if it was
     /// the one.
@@ -1509,6 +1524,10 @@ private final class MarqueeStatusItem: NSObject {
     /// when the card folded the menu could only jump to the new height.
     private func toggleCard() {
         if card != nil { closeCard(); return }
+        // The press on the item may already have put the card away (the
+        // outside-click monitor sees it first when the menu bar is drawn by
+        // the system); the release that follows must not bring it back.
+        if CACurrentMediaTime() - cardClosedAt < 0.4 { return }
         guard let button = statusItem.button, let barWindow = button.window else { return }
 
         player.openActive()
@@ -1522,7 +1541,7 @@ private final class MarqueeStatusItem: NSObject {
         // sized from outside, in step with the card, and the card fills it.
         host.sizingOptions = []
         let size = NSSize(width: NowPlayingCard.width,
-                          height: NowPlayingCard.height(players: player.players.count,
+                          height: NowPlayingCard.height(players: player.shownPlayers.count,
                                                         anyOpen: player.hasOpen))
 
         // See-through, like a menu. The glass the system's own menus and
@@ -1610,7 +1629,10 @@ private final class MarqueeStatusItem: NSObject {
         ].compactMap { $0 }
     }
 
+    private var cardClosedAt: CFTimeInterval = 0
+
     private func closeCard() {
+        if card != nil { cardClosedAt = CACurrentMediaTime() }
         player.stopWatching()
         cardResize?.invalidate()
         cardResize = nil
@@ -1635,7 +1657,7 @@ private final class MarqueeStatusItem: NSObject {
         guard let panel = card else { return }
         cardResize?.invalidate()
         let from = panel.frame.height
-        let target = NowPlayingCard.height(players: player.players.count, anyOpen: player.hasOpen)
+        let target = NowPlayingCard.height(players: player.shownPlayers.count, anyOpen: player.hasOpen)
         guard abs(target - from) > 0.5 else { return }
         let top = panel.frame.maxY
         let start = CACurrentMediaTime()
@@ -1767,13 +1789,22 @@ private struct NowPlayingCard: View {
     /// that was open.
     var body: some View {
         VStack(spacing: 0) {
-            ForEach(Array(player.players.enumerated()), id: \.element.id) { index, item in
+            ForEach(Array(player.shownPlayers.enumerated()), id: \.element.id) { index, item in
                 PlayerBlock(model: player, item: item, open: item.id == player.openID,
                             first: index == 0, openSettings: openSettings, openSource: openSource)
             }
         }
         .frame(maxHeight: .infinity, alignment: .top)
-        .onChange(of: player.players.count) { _ in resized() }
+        // Collapse to the playing track, or show every player again. Only
+        // there when there is more than one to hide.
+        .overlay(alignment: .top) {
+            if player.players.count > 1 {
+                CollapseToggle(collapsed: player.collapsed) {
+                    withAnimation(Self.fold) { player.collapsed.toggle() }
+                }
+            }
+        }
+        .onChange(of: player.shownPlayers.count) { _ in resized() }
         .onChange(of: player.hasOpen) { _ in resized() }
     }
 }
@@ -2003,6 +2034,29 @@ private final class CardPanel: NSPanel {
 }
 
 /// The way into Settings: a small gear over the corner of the artwork.
+/// The chevron at the middle of the card's top edge: up collapses the card to the track
+/// that is playing, down shows every player again.
+private struct CollapseToggle: View {
+    let collapsed: Bool
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: collapsed ? "chevron.down" : "chevron.up")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundStyle(Color.primary.opacity(hovering ? 0.8 : 0.4))
+                .frame(width: 18, height: 14)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .help(collapsed ? "Show all players" : "Show only what is playing")
+        .accessibilityLabel(collapsed ? "Expand" : "Collapse")
+        .padding(.top, 1)
+    }
+}
+
 private struct SettingsBadge: View {
     let action: () -> Void
     @State private var hovering = false
