@@ -1927,7 +1927,8 @@ private final class MarqueeStatusItem: NSObject {
         host.sizingOptions = []
         let size = NSSize(width: NowPlayingCard.width,
                           height: NowPlayingCard.height(players: player.shownPlayers.count,
-                                                        anyOpen: player.hasOpen))
+                                                        anyOpen: player.hasOpen,
+                                                        toggle: player.players.count > 1))
 
         // See-through, like a menu. The glass the system's own menus and
         // Control Center are made of, rounded by itself; before macOS 26, the
@@ -2042,7 +2043,8 @@ private final class MarqueeStatusItem: NSObject {
         guard let panel = card else { return }
         cardResize?.invalidate()
         let from = panel.frame.height
-        let target = NowPlayingCard.height(players: player.shownPlayers.count, anyOpen: player.hasOpen)
+        let target = NowPlayingCard.height(players: player.shownPlayers.count, anyOpen: player.hasOpen,
+                                           toggle: player.players.count > 1)
         guard abs(target - from) > 0.5 else { return }
         let top = panel.frame.maxY
         let start = CACurrentMediaTime()
@@ -2161,9 +2163,12 @@ private struct NowPlayingCard: View {
     /// A folded row for every player, one of them perhaps opened out. Known
     /// in advance rather than measured, so the window can set off for it at
     /// the same moment as the card.
-    static func height(players: Int, anyOpen: Bool) -> CGFloat {
+    static func height(players: Int, anyOpen: Bool, toggle: Bool = false) -> CGFloat {
         CGFloat(max(players, 1)) * foldedHeight + (anyOpen ? openHeight - foldedHeight : 0)
+            + (toggle ? toggleRoom : 0)
     }
+    /// A strip over the players for the collapse button, when there is one.
+    static let toggleRoom: CGFloat = 12
     /// How long folding takes. The card and its window both use it, on the
     /// same curve (`.easeInOut`, see `easeInOut(_:)`), so they move as one.
     static let foldDuration: TimeInterval = 0.45
@@ -2179,6 +2184,7 @@ private struct NowPlayingCard: View {
                             first: index == 0, openSettings: openSettings, openSource: openSource)
             }
         }
+        .padding(.top, player.players.count > 1 ? Self.toggleRoom : 0)
         .frame(maxHeight: .infinity, alignment: .top)
         // Collapse to the playing track, or show every player again. Only
         // there when there is more than one to hide.
@@ -2190,6 +2196,7 @@ private struct NowPlayingCard: View {
             }
         }
         .onChange(of: player.shownPlayers.count) { _ in resized() }
+        .onChange(of: player.players.count > 1) { _ in resized() }
         .onChange(of: player.hasOpen) { _ in resized() }
     }
 }
@@ -2233,7 +2240,9 @@ private struct PlayerBlock: View {
                     MarqueeText(text: item.hasTrack ? item.title : "Not Playing",
                                 font: .systemFont(ofSize: 14, weight: .semibold),
                                 moves: item.isPlaying)
-                    if item.hasTrack { PlayingIndicator(playing: item.isPlaying) }
+                    // The bars are the lyrics button: they show or hide
+                    // the words of what is playing over the screen.
+                    if item.hasTrack { LyricsBars(model: model, playing: item.isPlaying) }
                 }
                 subtitleText
             }
@@ -2436,14 +2445,14 @@ private struct CollapseToggle: View {
             Image(systemName: collapsed ? "chevron.down" : "chevron.up")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundStyle(Color.primary.opacity(hovering ? 0.8 : 0.4))
-                .frame(width: 18, height: 14)
+                .frame(width: 40, height: 18)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
         .help(collapsed ? "Show all players" : "Show only what is playing")
         .accessibilityLabel(collapsed ? "Expand" : "Collapse")
-        .padding(.top, 1)
+        .padding(.top, 2)
     }
 }
 
@@ -2551,12 +2560,39 @@ private struct ArtworkTile: View {
 /// redrawing them every frame in this process: drawn by SwiftUI, they and
 /// the scrolling titles kept the app near a third of a core busy for as long
 /// as the card was open.
+/// The jumping bars beside the title, and the lyrics button: a click shows
+/// the words of what is playing at the bottom of the screen, or hides them.
+/// Lit in the accent colour while they are shown.
+private struct LyricsBars: View {
+    let model: NowPlayingModel
+    let playing: Bool
+    @ObservedObject private var lyrics = LyricsController.shared
+    @State private var hovering = false
+
+    var body: some View {
+        PlayingIndicator(playing: playing, lit: lyrics.isOn)
+            .allowsHitTesting(false)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 3)
+            .background(RoundedRectangle(cornerRadius: 4)
+                .fill(Color.primary.opacity(hovering ? 0.1 : 0)))
+            .contentShape(Rectangle())
+            .highPriorityGesture(TapGesture().onEnded { lyrics.toggle(model) })
+            .onHover { hovering = $0 }
+            .help(lyrics.isOn ? "Hide lyrics" : "Show lyrics on screen")
+    }
+}
+
 private struct PlayingIndicator: NSViewRepresentable {
     let playing: Bool
+    var lit = false
 
     func makeNSView(context: Context) -> BarsView { BarsView() }
 
-    func updateNSView(_ view: BarsView, context: Context) { view.playing = playing }
+    func updateNSView(_ view: BarsView, context: Context) {
+        view.playing = playing
+        view.lit = lit
+    }
 
     func sizeThatFits(_ proposal: ProposedViewSize, nsView: BarsView, context: Context) -> CGSize? {
         nsView.intrinsicContentSize
@@ -2573,6 +2609,10 @@ private final class BarsView: NSView {
 
     var playing = false {
         didSet { if playing != oldValue { animate() } }
+    }
+    /// In the accent colour rather than grey.
+    var lit = false {
+        didSet { if lit != oldValue { needsDisplay = true } }
     }
 
     private var barLayers: [CALayer] = []
@@ -2602,7 +2642,7 @@ private final class BarsView: NSView {
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
-        let colour = NSColor.secondaryLabelColor.cgColor
+        let colour = (lit ? NSColor.controlAccentColor : NSColor.secondaryLabelColor).cgColor
         for bar in barLayers { bar.backgroundColor = colour }
     }
 
