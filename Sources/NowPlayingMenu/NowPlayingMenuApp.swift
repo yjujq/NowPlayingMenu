@@ -3068,6 +3068,8 @@ private final class MarqueeView: NSView {
 /// sized to hold all of them at once and the whole of it stays in view.
 private struct SettingsView: View {
     @ObservedObject var settings: DisplaySettings
+    @AppStorage(LyricsController.languageKey) private var subtitleLanguage = "ru"
+    @AppStorage(LyricsController.openSubtitlesKey) private var openSubtitlesKey = ""
 
     static let width: CGFloat = 400
     /// Every control ends on the same trailing edge and, being this wide,
@@ -3182,6 +3184,23 @@ private struct SettingsView: View {
                         .pickerStyle(.segmented)
                         .labelsHidden()
                         .frame(width: Self.controlWidth)
+                    }
+                }
+
+                SettingsCard("Subtitles", footnote: "Shown by clicking the bars in the card. Songs come from "
+                             + "LRCLIB; films need a free key from opensubtitles.com.") {
+                    SettingsRow("Translate to") {
+                        Picker("", selection: $subtitleLanguage) {
+                            ForEach(LyricsController.languages, id: \.code) { Text($0.name).tag($0.code) }
+                        }
+                        .labelsHidden()
+                        .frame(width: Self.controlWidth)
+                    }
+                    SettingsDivider()
+                    SettingsRow("OpenSubtitles key") {
+                        SecureField("API key", text: $openSubtitlesKey)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: Self.controlWidth)
                     }
                 }
 
