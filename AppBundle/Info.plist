@@ -22,5 +22,7 @@
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Now Playing Menu reads the media in your Safari and Chrome tabs and plays or pauses it, so that every tab with a video or a song shows in the card.</string>
 </dict>
 </plist>

@@ -12,6 +12,19 @@ if (!cls) {
   // Methods of a class looked up by name can only be called through a selector:
   // accessing them as properties throws a TypeError.
   const item = cls.performSelector($.NSSelectorFromString("localNowPlayingItem"));
+  // The app that is playing. Web audio is played by WebKit's GPU process on
+  // behalf of a browser, and then the browser is the parent.
+  const source = (() => {
+    const path = cls.performSelector($.NSSelectorFromString("localNowPlayingPlayerPath"));
+    if (!path || path.isNil()) return null;
+    const client = path.performSelector($.NSSelectorFromString("client"));
+    if (!client || client.isNil()) return null;
+    for (const key of ["parentApplicationBundleIdentifier", "bundleIdentifier"]) {
+      const id = client.performSelector($.NSSelectorFromString(key));
+      if (id && !id.isNil() && id.js) return id.js;
+    }
+    return null;
+  })();
   if (!item || item.isNil()) {
     reply({ title: null, artist: null, album: null, playbackRate: 0 });
   } else {
@@ -39,7 +52,11 @@ if (!cls) {
       // without one there is nothing to show.
       duration: get("kMRMediaRemoteNowPlayingInfoDuration") || 0,
       elapsedTime: get("kMRMediaRemoteNowPlayingInfoElapsedTime") || 0,
-      timestamp: moment("kMRMediaRemoteNowPlayingInfoTimestamp")
+      timestamp: moment("kMRMediaRemoteNowPlayingInfoTimestamp"),
+      // The picture itself is not in this dictionary, only a name for it
+      // that changes with it; the app fetches the picture when it does.
+      artworkIdentifier: get("kMRMediaRemoteNowPlayingInfoArtworkIdentifier"),
+      source: source
     });
   }
 }
