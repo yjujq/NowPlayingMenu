@@ -109,6 +109,8 @@ async function wait() {
   try {
     while (frames.size) {
       const r = await fetch(`http://127.0.0.1:47811/wait?instance=${INSTANCE}`);
+      // Turned away: not asked again at once, round and round.
+      if (!r.ok) { await new Promise((res) => setTimeout(res, 5000)); continue; }
       const { commands = [] } = await r.json();
       for (const c of commands) run(c);
     }

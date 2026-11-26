@@ -82,6 +82,9 @@ final class ChromeBridge: @unchecked Sendable {
     private func serve(_ connection: NWConnection) {
         connection.start(queue: queue)
         receive(connection, buffer: Data())
+        // A request never finished, or a held /wait never answered, is not
+        // kept open for ever.
+        queue.asyncAfter(deadline: .now() + 30) { connection.cancel() }
     }
 
     private func receive(_ connection: NWConnection, buffer: Data) {
@@ -140,11 +143,25 @@ final class ChromeBridge: @unchecked Sendable {
     }
 
     private func respond(_ connection: NWConnection, _ request: Request) {
-        // Only an extension may talk to it — not any web page the user opens.
+        // Only an extension may talk to it — not any web page the user opens,
+        // nor one that has had its name pointed at this Mac (the Host it
+        // sends is then its own), nor another program on the Mac.
         let origin = request.headers["origin"] ?? ""
+        let host = request.headers["host"]?.lowercased() ?? ""
+        let fromExtension = origin.hasPrefix("chrome-extension://")
         var status = "200 OK"
         var reply: [String: Any] = [:]
-        if !origin.isEmpty && !origin.hasPrefix("chrome-extension://") {
+        if !["127.0.0.1:\(Self.port)", "localhost:\(Self.port)"].contains(host)
+            || (!origin.isEmpty && !fromExtension) {
+            status = "403 Forbidden"
+        } else if request.method == "GET", request.path == "/ping" {
+            // Anyone on the Mac may ask whether it runs; what plays, only the extension.
+            reply = ["app": "NowPlayingMenu", "connected": isConnected]
+            if fromExtension { reply.merge(["items": current, "card": shown, "bar": bar]) { $1 } }
+        } else if !fromExtension && request.method == "POST" {
+            // Chrome names the extension on its POSTs; a GET /wait from the
+            // worker may carry no Origin, and is let through — it only
+            // collects the commands for its own instance.
             status = "403 Forbidden"
         } else if request.method == "POST", request.path == "/state",
                   let object = (try? JSONSerialization.jsonObject(with: request.body)) as? [String: Any] {
@@ -170,8 +187,6 @@ final class ChromeBridge: @unchecked Sendable {
                 self.reply(connection, origin: origin, status: "200 OK", ["commands": []])
             }
             return
-        } else if request.method == "GET", request.path == "/ping" {
-            reply = ["app": "NowPlayingMenu", "connected": isConnected, "items": current, "card": shown, "bar": bar]
         } else {
             status = "404 Not Found"
         }

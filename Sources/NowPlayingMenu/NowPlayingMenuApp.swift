@@ -101,7 +101,22 @@ final class NowPlayingModel: ObservableObject {
         /// For a tab from the Chrome extension: its site's icon, in
         /// `tabArtwork`, shown when there is no cover.
         var faviconKey: String? = nil
+        /// What the video plays, as the site or the description says.
+        var music: Music? = nil
         var hasTrack: Bool { !title.isEmpty }
+
+        struct Music: Equatable, Hashable {
+            let title: String
+            let artist: String
+            let url: URL?
+            let tags: [String]
+            /// The site's "original sound": the author's own, no song to look up.
+            var isOriginal: Bool {
+                title.range(of: #"(original|оригинальный)\s+(sound|audio|звук)"#,
+                            options: [.regularExpression, .caseInsensitive]) != nil
+            }
+        }
+
 
         /// Skips by a few seconds rather than changing track — a video in a
         /// browser does — so its buttons are −15 and +15, as in Control Center.
@@ -353,12 +368,22 @@ final class NowPlayingModel: ObservableObject {
             let host = (entry["host"] as? String ?? "").lowercased()
                 .replacingOccurrences(of: "^www\\.", with: "", options: .regularExpression)
             if !host.isEmpty { hosts["tab|\(browser)|\(window)|\(index)"] = host }
+            let music = (entry["music"] as? [String: Any]).map { music in
+                Player.Music(title: music["title"] as? String ?? "", artist: music["artist"] as? String ?? "",
+                             url: (music["url"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) },
+                             tags: music["tags"] as? [String] ?? [])
+            }
+            // The track the site or the description names is what the card
+            // shows, in place of the page's title; its own "original sound"
+            // is not a track, and leaves the page's title be.
+            let named = music.flatMap { !$0.title.isEmpty && !$0.isOriginal ? $0 : nil }
             found.append(Player(
                 id: "tab|\(browser)|\(window)|\(index)",
                 source: place.bundleIdentifier,
                 name: place.appName,
-                title: title,
-                artist: artist.isEmpty ? (entry["host"] as? String ?? "") : artist,
+                title: named?.title ?? title,
+                artist: named.map { $0.artist.isEmpty ? artist : $0.artist }
+                    ?? (artist.isEmpty ? (entry["host"] as? String ?? "") : artist),
                 album: "",
                 isPlaying: playing,
                 progress: duration > 0 ? Progress(reading: time, taken: (entry["at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue / 1000) } ?? Date(), duration: duration,
@@ -367,7 +392,8 @@ final class NowPlayingModel: ObservableObject {
                 abilities: (entry["tracks"] as? Bool ?? false) ? .tabTracks
                     : entry["controls"] as? String == "button" ? .tabButton : .tab,
                 tab: place,
-                faviconKey: favicon?.isEmpty == false ? favicon : nil
+                faviconKey: favicon?.isEmpty == false ? favicon : nil,
+                music: music
             ))
         }
         // One player per site: the one playing, else the one that played
@@ -399,13 +425,48 @@ final class NowPlayingModel: ObservableObject {
         let wanted = Set(tabs.compactMap(\.artworkKey) + tabs.compactMap(\.faviconKey))
         let kept = tabArtwork.filter { wanted.contains($0.key) }
         if kept.count != tabArtwork.count { tabArtwork = kept }
-        for address in wanted where tabArtwork[address] == nil {
-            guard let url = URL(string: address), ["http", "https", "data"].contains(url.scheme ?? "") else { continue }
-            URLSession.shared.dataTask(with: url) { [weak self] data, _, _ in
-                guard let data, let image = NSImage(data: data) else { return }
+        // One request per address: not again while it is on its way, nor
+        // after it failed.
+        for address in wanted where tabArtwork[address] == nil && !artworkAsked.contains(address) {
+            guard let url = URL(string: address), Self.safeArtworkURL(url) else { continue }
+            artworkAsked.insert(address)
+            var request = URLRequest(url: url, timeoutInterval: 15)
+            request.setValue("image/*", forHTTPHeaderField: "Accept")
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, _ in
+                let small = (data?.count ?? 0) <= Self.artworkLimit
+                    && (response?.expectedContentLength ?? 0) <= Int64(Self.artworkLimit)
+                guard small, let data, let image = NSImage(data: data) else { return }
                 onMain { self?.tabArtwork[address] = image }
             }.resume()
         }
+        // Forgotten once no tab shows them, so a page that comes back is asked again.
+        artworkAsked.formIntersection(wanted)
+    }
+
+    private var artworkAsked: Set<String> = []
+    private static let artworkLimit = 3 << 20
+
+    /// A picture the page names is fetched by the app, so only from the open
+    /// web: https (or a data: URL the extension made), never this Mac or the
+    /// local network.
+    nonisolated static func safeArtworkURL(_ url: URL) -> Bool {
+        if url.scheme == "data" { return true }
+        guard url.scheme == "https", let host = url.host?.lowercased(), !host.isEmpty else { return false }
+        if host == "localhost" || host.hasSuffix(".local") || host.hasSuffix(".localhost")
+            || host.hasSuffix(".internal") || !host.contains(".") && !host.contains(":") { return false }
+        // An address written out: no loopback, private, link-local or unspecified.
+        let parts = host.split(separator: ".").compactMap { Int($0) }
+        if parts.count == 4 {
+            let (a, b) = (parts[0], parts[1])
+            if a == 0 || a == 10 || a == 127 || (a == 169 && b == 254) || (a == 172 && (16...31).contains(b))
+                || (a == 192 && b == 168) || (a == 100 && (64...127).contains(b)) || a >= 224 { return false }
+        }
+        if host.contains(":") {   // IPv6
+            let bare = host.trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+            if bare == "::1" || bare == "::" || bare.hasPrefix("fc") || bare.hasPrefix("fd")
+                || bare.hasPrefix("fe80") || bare.hasPrefix("::ffff:") { return false }
+        }
+        return true
     }
 
     /// Brings the browser forward on that tab.
@@ -479,10 +540,19 @@ final class NowPlayingModel: ObservableObject {
         }
     }
 
+    /// One reading at a time: if the system is slow to answer, readings
+    /// are not stacked up behind it.
+    private var refreshing = false
+
     func refresh() {
+        guard !refreshing else { return }
+        refreshing = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let info = SystemNowPlaying.fetch()
-            onMain { self?.apply(info) }
+            onMain {
+                self?.refreshing = false
+                self?.apply(info)
+            }
         }
     }
 
@@ -592,10 +662,16 @@ final class NowPlayingModel: ObservableObject {
         refresh()
         refreshOthers()
         watchTimer?.invalidate()
+        // The main track every two seconds; the other players and the
+        // browsers' tabs every four — the extension reports Chrome's itself
+        // as they change.
+        var even = false
         watchTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            even.toggle()
+            let others = even
             Task { @MainActor in
                 self?.refresh()
-                self?.refreshOthers()
+                if others { self?.refreshOthers() }
             }
         }
     }
@@ -605,14 +681,21 @@ final class NowPlayingModel: ObservableObject {
         watchTimer = nil
     }
 
+    private var readingOthers = false
+
     func refreshOthers() {
         refreshTabs()
+        guard !readingOthers else { return }
+        readingOthers = true
         // Pictures already in hand are not sent again.
         let known = otherArtwork.keys.joined(separator: "\n")
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let data = SystemHelper.call("NPMWritePlayers", environment: ["NPM_KNOWN_ARTWORK": known])
             let entries = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [[String: Any]] ?? []
-            onMain { self?.applyOthers(entries) }
+            onMain {
+                self?.readingOthers = false
+                self?.applyOthers(entries)
+            }
         }
     }
 
@@ -955,6 +1038,9 @@ private enum SystemNowPlaying {
 
         do {
             try process.run()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 8) {
+                if process.isRunning { process.terminate() }
+            }
             // Read before waiting for exit: otherwise a full pipe buffer
             // stalls the child process and both of us get stuck.
             let data = output.fileHandleForReading.readDataToEndOfFile()
@@ -1364,6 +1450,10 @@ private enum SystemHelper {
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            // mediaremoted can hang; perl is not waited on for ever.
+            DispatchQueue.global().asyncAfter(deadline: .now() + 8) {
+                if process.isRunning { process.terminate() }
+            }
             let data = output.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
             return process.terminationStatus == 0 && !data.isEmpty ? data : nil
@@ -2288,7 +2378,8 @@ private struct PlayerBlock: View {
         // What lies past its edges — the bar and the back button, folded —
         // is cut off here, not left to show over the player below.
         .frame(width: NowPlayingCard.width,
-               height: open ? NowPlayingCard.openHeight : NowPlayingCard.foldedHeight,
+               height: open ? NowPlayingCard.openHeight
+                            : NowPlayingCard.foldedHeight,
                alignment: .top)
         .clipped()
         // A hairline between it and the player above, inset like the

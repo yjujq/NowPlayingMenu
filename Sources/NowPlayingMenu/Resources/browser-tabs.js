@@ -32,10 +32,77 @@ const READ = `(function () {
   var waiting = all.filter(function (x) { return !x.muted; });
   var e = live.filter(function (x) { return !x.paused; })[0] || live[0] || (md ? waiting[0] : null);
   var art = md && md.artwork && md.artwork.length ? md.artwork[md.artwork.length - 1].src : "";
+  // What the video plays, as the site or its author says: the site's own
+  // label of the sound (TikTok's /music/, Instagram's /reels/audio/),
+  // YouTube's Music section, else a line of the description — "🎵 Artist -
+  // Song", "Track: …" — and its hashtags. Looked for around the element
+  // playing first, so that in a feed it is the post being watched.
+  var musicInfo = function (el) {
+    var clean = function (s) { return (s || "").replace(/\\s+/g, " ").trim(); };
+    var near = function (selector) {
+      var node = el;
+      for (var depth = 0; node && depth < 16; depth++) {
+        var found = node.querySelector ? node.querySelector(selector) : null;
+        if (found) return found;
+        node = node.parentElement || (node.getRootNode && node.getRootNode() !== node ? node.getRootNode().host : null);
+      }
+      return document.querySelector(selector);
+    };
+    var split = function (text, artistFirst) {
+      var m = text.match(/^(.+?)\\s+[-–—·]\\s+(.+)$/);
+      if (!m) return { title: text, artist: "" };
+      return artistFirst ? { title: m[2], artist: m[1] } : { title: m[1], artist: m[2] };
+    };
+    var result = null;
+    var label = near('[data-e2e="browse-music"] a, [data-e2e="video-music"] a, a[href*="/music/"], a[href*="/reels/audio/"], a[href*="/audio/"]');
+    // The label's own words: the innermost piece with the separator in it.
+    // Instagram adds "Audio image" (the icon's name) and, as the line runs
+    // along, a second copy of its start.
+    var text = "";
+    if (label) {
+      var pieces = label.querySelectorAll("span, div");
+      for (var k = 0; k < pieces.length && !text; k++) {
+        var piece = pieces[k];
+        if (piece.children.length === 0 && / [·\\-–—] /.test(piece.textContent)) text = clean(piece.textContent);
+      }
+      if (!text) text = clean(label.textContent.replace(/^(Audio image|Аудио)/i, ""));
+    }
+    if (text) {
+      // Instagram: "Artist · Song"; TikTok: "Song - Artist".
+      result = split(text, text.indexOf(" · ") > 0);
+      result.url = label.href;
+    }
+    if (!result) {
+      var yt = document.querySelector("yt-video-attribute-view-model, ytd-video-attribute-view-model");
+      var t = yt && yt.querySelector('[class*="__title"]');
+      if (t && clean(t.textContent)) {
+        var s = yt.querySelector('[class*="__subtitle"]');
+        result = { title: clean(t.textContent), artist: clean(s && s.textContent), url: "" };
+      }
+    }
+    var desc = near('[data-e2e="browse-video-desc"], [data-e2e="video-desc"], #description-inline-expander, ytd-text-inline-expander, #description, h1, [class*="caption" i], [class*="description" i]');
+    var body = desc ? (desc.innerText || desc.textContent || "") : "";
+    if (!result && body) {
+      var lines = body.split(/\\n/);
+      for (var i = 0; i < lines.length && !result; i++) {
+        var m = lines[i].match(/(?:🎵|🎶|♪|♫|🎧|🎤)️?\\s*[:：]?\\s*(.{2,90})|(?:song|track|music|sound|audio|трек|песня|музыка|звук|саундтрек)\\s*[:：]\\s*(.{2,90})/i);
+        if (m) {
+          var value = clean((m[1] || m[2]).replace(/#\\S+/g, ""));
+          if (value) { result = split(value, true); result.url = ""; }
+        }
+      }
+    }
+    var tags = (body.match(/#[^\\s#.,!?;:]+/g) || []).slice(0, 6);
+    if (!result && !tags.length) return null;
+    result = result || { title: "", artist: "", url: "" };
+    result.tags = tags;
+    return result;
+  };
   return JSON.stringify({
     title: (md && md.title) || document.title,
     artist: (md && md.artist) || "",
     host: location.hostname,
+    music: musicInfo(e),
     artwork: art,
     playing: e ? !e.paused : session.playbackState === "playing",
     time: e ? e.currentTime : 0,

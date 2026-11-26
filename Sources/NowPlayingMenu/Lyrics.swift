@@ -70,6 +70,7 @@ final class LyricsController: ObservableObject {
         cancelAll()
         window?.orderOut(nil); window = nil
         lines = []; trackKey = ""; current = ""; second = ""
+        cachedPlayer = nil; lookedUpAt = .distantPast
     }
 
     private func cancelAll() {
@@ -87,9 +88,21 @@ final class LyricsController: ObservableObject {
             ?? all.first
     }
 
+    /// The player, looked up once a second rather than every tick: listing
+    /// the players asks the system about each app. The position is carried
+    /// forward between lookups from the reading it holds.
+    private var cachedPlayer: NowPlayingModel.Player?
+    private var lookedUpAt = Date.distantPast
+
     private func tick() {
-        guard let player else { show("Nothing is playing", ""); return }
-        let key = [player.title, player.artist, language].joined(separator: "|")
+        if Date().timeIntervalSince(lookedUpAt) >= 1 {
+            cachedPlayer = player
+            lookedUpAt = Date()
+        }
+        guard let player = cachedPlayer else { show("Nothing is playing", ""); return }
+        let key = [player.title, player.artist, player.music?.title ?? "", language].joined(separator: "|")
+        // Paused on the same track, its line on screen: nothing moves.
+        if key == trackKey, !player.isPlaying, !lines.isEmpty { return }
         if key != trackKey {
             trackKey = key
             lines = []
@@ -129,7 +142,12 @@ final class LyricsController: ObservableObject {
         let duration = player.progress?.duration ?? 0
         let looksLikeFilm = duration > 20 * 60
         let song = { [weak self] (then: @escaping @MainActor () -> Void) in
-            self?.findLyrics(title: player.title, artist: player.artist, duration: duration, key: key, otherwise: then)
+            // What the site or the description names beats the page's title.
+            if let music = player.music, !music.title.isEmpty, !music.isOriginal {
+                self?.findLyrics(title: music.title, artist: music.artist, duration: 0, key: key, otherwise: then)
+            } else {
+                self?.findLyrics(title: player.title, artist: player.artist, duration: duration, key: key, otherwise: then)
+            }
         }
         let film = { [weak self] (then: @escaping @MainActor () -> Void) in
             guard let self, !self.apiKey.isEmpty else { then(); return }
@@ -221,7 +239,7 @@ final class LyricsController: ObservableObject {
                 guard let address = (link as? [String: Any])?["link"] as? String, let url = URL(string: address) else {
                     otherwise(); return
                 }
-                self.text(URLRequest(url: url)) { srt in
+                self.text(URLRequest(url: url, timeoutInterval: 20)) { srt in
                     guard key == self.trackKey else { return }
                     let lines = srt.map(Self.parseSRT) ?? []
                     lines.isEmpty ? otherwise()
@@ -326,9 +344,15 @@ final class LyricsController: ObservableObject {
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("NowPlayingMenu v1.0", forHTTPHeaderField: "User-Agent")
         }
-        let task = URLSession.shared.dataTask(with: request) { data, response, _ in
+        var task: URLSessionDataTask!
+        task = URLSession.shared.dataTask(with: request) { data, response, _ in
             let ok = ((response as? HTTPURLResponse)?.statusCode ?? 0) < 400
-            DispatchQueue.main.async { MainActor.assumeIsolated { done(ok ? data : nil) } }
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    LyricsController.shared.tasks.removeAll { $0 === task }
+                    done(ok ? data : nil)
+                }
+            }
         }
         tasks.append(task)
         task.resume()
